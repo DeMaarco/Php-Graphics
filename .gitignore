@@ -1,0 +1,32 @@
+# --- OS / Editor ---
+.DS_Store
+Thumbs.db
+desktop.ini
+.vscode/
+.idea/
+
+# --- Environment / local config ---
+.env
+.env.*
+*.local
+
+# --- PHP runtime leftovers ---
+*.log
+*.tmp
+*.cache
+
+# --- Upload/completion temp markers ---
+*.complete
+
+# --- Native build artifacts (C/FFI) ---
+*.dll
+*.so
+*.dylib
+*.o
+*.obj
+*.a
+*.lib
+*.exe
+
+# --- Large local dataset file ---
+openpowerlifting.csv
