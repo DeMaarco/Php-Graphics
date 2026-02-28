@@ -37,8 +37,8 @@ if ($offset < 0) {
 if ($limit < 50) {
     $limit = 50;
 }
-if ($limit > 5000) {
-    $limit = 5000;
+if ($limit > 50000) {
+    $limit = 50000;
 }
 
 $entry = $_SESSION['csv_uploads'][$uploadId] ?? null;

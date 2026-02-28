@@ -1,0 +1,6 @@
+services:
+  - type: web
+    name: etl-php-c
+    runtime: docker
+    plan: free
+    autoDeploy: true

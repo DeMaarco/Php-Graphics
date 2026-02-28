@@ -123,6 +123,15 @@ if (
       text-align: left;
     }
 
+    tbody tr {
+      height: 36px;
+    }
+
+    tbody td {
+      min-height: 36px;
+      line-height: 20px;
+    }
+
     tbody tr:nth-child(odd) {
       background: #171717;
     }
@@ -200,15 +209,18 @@ if (
     const status = document.getElementById('status');
 
     // Parámetros de rendimiento para carga, stream y virtualización de tabla.
-    const CHUNK_SIZE = 5000;
+    const CHUNK_SIZE = 50000;
     const ROW_HEIGHT = 36;
     const OVERSCAN = 8;
     const PREVIEW_ROWS = 5000;
     const PREVIEW_BYTES = 16 * 1024 * 1024;
-    const UPLOAD_CHUNK_BYTES = 512 * 1024;
-    const MAX_APPEND_PER_FRAME = 5000;
+    const UPLOAD_CHUNK_BYTES = 4 * 1024 * 1024;
+    const MAX_APPEND_PER_FRAME = 50000;
     const INCOMING_HIGH_WATER = CHUNK_SIZE * 2;
     const INCOMING_LOW_WATER = Math.max(500, Math.floor(CHUNK_SIZE / 2));
+    const POLL_FAST_MS = 45;
+    const POLL_IDLE_MS = 220;
+    const PERF_REFRESH_MS = 400;
 
     // Estado global de la sesión de carga/render.
     const state = {
@@ -222,12 +234,27 @@ if (
       sessionId: 0,
       lastRenderKey: '',
       lastRenderTotal: 0,
-      eventSource: null,
-      streamPaused: false,
+      pollTimer: 0,
+      pollInFlight: false,
+      pollDelayMs: POLL_FAST_MS,
       renderRaf: 0,
       applyRaf: 0,
       incomingRows: [],
-      tbody: null
+      tbody: null,
+      metrics: {
+        startedAt: 0,
+        uploadEndedAt: 0,
+        firstRowsAt: 0,
+        pollCalls: 0,
+        pollTimeMs: 0,
+        pollRows: 0,
+        renderCalls: 0,
+        renderTimeMs: 0,
+        applyCalls: 0,
+        applyTimeMs: 0,
+        completeLogged: false,
+        lastUiRefreshAt: 0
+      }
     };
 
     dropzone.addEventListener('click', () => fileInput.click());
@@ -287,11 +314,26 @@ if (
       state.lastRenderTotal = 0;
       state.tbody = null;
       state.incomingRows = [];
-      state.streamPaused = false;
-      if (state.eventSource) {
-        state.eventSource.close();
-        state.eventSource = null;
+      if (state.pollTimer) {
+        clearTimeout(state.pollTimer);
+        state.pollTimer = 0;
       }
+      state.pollInFlight = false;
+      state.pollDelayMs = POLL_FAST_MS;
+      state.metrics = {
+        startedAt: 0,
+        uploadEndedAt: 0,
+        firstRowsAt: 0,
+        pollCalls: 0,
+        pollTimeMs: 0,
+        pollRows: 0,
+        renderCalls: 0,
+        renderTimeMs: 0,
+        applyCalls: 0,
+        applyTimeMs: 0,
+        completeLogged: false,
+        lastUiRefreshAt: 0
+      };
       if (state.renderRaf) {
         cancelAnimationFrame(state.renderRaf);
         state.renderRaf = 0;
@@ -312,13 +354,32 @@ if (
 
       clearCurrentSession();
       const sessionId = state.sessionId;
+      state.metrics.startedAt = performance.now();
 
       try {
         status.textContent = 'Preparando vista previa y subiendo...';
         dropzone.style.pointerEvents = 'none';
 
-        const uploadPromise = uploadFileInChunks(file, (percent) => {
-          status.textContent = `Subiendo archivo... ${percent}%`;
+        let previewReady = false;
+
+        const uploadPromise = uploadFileInChunks(file, {
+          onProgress: (percent) => {
+            status.textContent = `Subiendo archivo... ${percent}%`;
+          },
+          onUploadId: (uploadId) => {
+            if (!uploadId) return;
+            if (!state.uploadId) {
+              state.uploadId = uploadId;
+              state.nextOffset = 0;
+            }
+            state.hasMore = true;
+          },
+          onChunkUploaded: async () => {
+            if (!previewReady || sessionId !== state.sessionId || !state.uploadId) return;
+            if (!state.pollInFlight) {
+              startBackgroundLoading(sessionId);
+            }
+          }
         });
 
         const localPreview = await buildLocalPreview(file);
@@ -337,6 +398,11 @@ if (
           scheduleRender();
         }
 
+        previewReady = true;
+        if (state.uploadId) {
+          await fetchRowsOnce(sessionId);
+        }
+
         status.textContent = 'Finalizando subida...';
         const payload = await uploadPromise;
         if (sessionId !== state.sessionId) return;
@@ -346,10 +412,10 @@ if (
         }
 
         state.uploadFinalized = true;
+        state.metrics.uploadEndedAt = performance.now();
         if (!state.uploadId) {
           state.uploadId = payload.upload_id || '';
         }
-        state.nextOffset = 0;
         state.hasMore = true;
         startBackgroundLoading(sessionId);
         status.textContent = '';
@@ -362,7 +428,10 @@ if (
     }
 
     // Sube el archivo en chunks secuenciales con validación de índice en backend.
-    async function uploadFileInChunks(file, onProgress) {
+    async function uploadFileInChunks(file, callbacks = {}) {
+      const onProgress = typeof callbacks.onProgress === 'function' ? callbacks.onProgress : () => {};
+      const onUploadId = typeof callbacks.onUploadId === 'function' ? callbacks.onUploadId : () => {};
+      const onChunkUploaded = typeof callbacks.onChunkUploaded === 'function' ? callbacks.onChunkUploaded : () => {};
       const totalChunks = Math.max(1, Math.ceil(file.size / UPLOAD_CHUNK_BYTES));
       let uploadId = '';
 
@@ -394,8 +463,10 @@ if (
         }
 
         uploadId = payload.upload_id || uploadId;
+        onUploadId(uploadId);
         const percent = Math.min(99, Math.round(((index + 1) / totalChunks) * 100));
         onProgress(percent);
+        onChunkUploaded(uploadId, index, totalChunks);
       }
 
       const finalizeResponse = await fetch('upload_complete.php', {
@@ -511,7 +582,28 @@ if (
 
     // Actualiza contador visible de filas cargadas.
     function updateCounter() {
-      counter.textContent = `${state.rows.length.toLocaleString('es-ES')} filas`;
+      const base = `${state.rows.length.toLocaleString('es-ES')} filas`;
+      if (!state.metrics.startedAt) {
+        counter.textContent = base;
+        return;
+      }
+
+      const now = performance.now();
+      const elapsedMs = now - state.metrics.startedAt;
+      const uploadMs = state.metrics.uploadEndedAt > 0
+        ? (state.metrics.uploadEndedAt - state.metrics.startedAt)
+        : elapsedMs;
+      const backendMs = state.metrics.pollTimeMs;
+      const uiMs = state.metrics.renderTimeMs + state.metrics.applyTimeMs;
+
+      const parts = [
+        base,
+        `up ${(uploadMs / 1000).toFixed(1)}s`,
+        `io ${(backendMs / 1000).toFixed(1)}s`,
+        `ui ${(uiMs / 1000).toFixed(1)}s`
+      ];
+
+      counter.textContent = parts.join(' · ');
     }
 
     // Programa un render en animation frame para evitar repaints excesivos.
@@ -526,6 +618,7 @@ if (
     // Renderiza solo filas visibles (virtual scroll).
     function renderVisibleRows() {
       if (!state.tbody) return;
+      const renderStart = performance.now();
 
       const total = state.rows.length;
       const columnCount = Math.max(1, state.headers.length);
@@ -592,35 +685,37 @@ if (
       }
 
       state.tbody.replaceChildren(fragment);
+      state.metrics.renderCalls += 1;
+      state.metrics.renderTimeMs += performance.now() - renderStart;
     }
 
-    // Inicia stream SSE y encola filas entrantes sin bloquear UI.
-    function startBackgroundLoading(sessionId) {
-      if (sessionId !== state.sessionId || !state.hasMore || !state.uploadId) {
-        return;
+    // Lee un lote de filas del backend para render incremental sin SSE largo.
+    async function fetchRowsOnce(sessionId) {
+      if (sessionId !== state.sessionId || !state.uploadId || !state.hasMore) {
+        return false;
       }
 
-      state.streamPaused = false;
-
-      if (state.eventSource) {
-        state.eventSource.close();
-        state.eventSource = null;
+      if (state.pollInFlight) {
+        return false;
       }
 
-      const params = new URLSearchParams({
-        upload_id: state.uploadId,
-        offset: String(state.nextOffset),
-        limit: String(CHUNK_SIZE)
-      });
+      state.pollInFlight = true;
+      const pollStart = performance.now();
 
-      const eventSource = new EventSource(`stream_rows.php?${params.toString()}`);
-      state.eventSource = eventSource;
+      try {
+        const params = new URLSearchParams({
+          upload_id: state.uploadId,
+          offset: String(state.nextOffset),
+          limit: String(CHUNK_SIZE)
+        });
 
-      eventSource.addEventListener('rows', (event) => {
-        if (sessionId !== state.sessionId) return;
+        const response = await fetch(`poll_rows.php?${params.toString()}`);
+        const text = await response.text();
+        const payload = safeParseJson(text);
 
-        const payload = safeParseJson(event.data);
-        if (!payload || typeof payload !== 'object') return;
+        if (!response.ok || !payload || payload.error) {
+          throw new Error((payload && payload.error) || 'Error leyendo filas incrementales.');
+        }
 
         let rows = Array.isArray(payload.rows) ? payload.rows : [];
         if (state.skipInitialRows > 0 && rows.length > 0) {
@@ -628,51 +723,76 @@ if (
           rows = rows.slice(cut);
           state.skipInitialRows -= cut;
         }
-        state.nextOffset = Number(payload.next_offset || state.nextOffset);
-        const serverHasMore = Boolean(payload.has_more);
-        state.hasMore = state.uploadFinalized ? serverHasMore : (serverHasMore || true);
+
+        state.nextOffset = Number(payload.next_offset ?? state.nextOffset);
+        state.hasMore = Boolean(payload.has_more);
         enqueueRows(rows);
 
-        if (!state.streamPaused && state.hasMore && state.incomingRows.length >= INCOMING_HIGH_WATER) {
-          state.streamPaused = true;
-          if (state.eventSource) {
-            state.eventSource.close();
-            state.eventSource = null;
-          }
-        }
-      });
+        state.metrics.pollCalls += 1;
+        state.metrics.pollRows += rows.length;
+        state.metrics.pollTimeMs += performance.now() - pollStart;
 
-      eventSource.addEventListener('end', () => {
+        if (!state.hasMore && state.uploadFinalized && !state.metrics.completeLogged) {
+          state.metrics.completeLogged = true;
+          const uiMs = state.metrics.renderTimeMs + state.metrics.applyTimeMs;
+          const uploadMs = state.metrics.uploadEndedAt > 0
+            ? (state.metrics.uploadEndedAt - state.metrics.startedAt)
+            : 0;
+          console.log('[perf] resumen', {
+            upload_s: +(uploadMs / 1000).toFixed(2),
+            backend_s: +(state.metrics.pollTimeMs / 1000).toFixed(2),
+            ui_s: +(uiMs / 1000).toFixed(2),
+            poll_calls: state.metrics.pollCalls,
+            poll_rows: state.metrics.pollRows,
+            render_calls: state.metrics.renderCalls,
+            apply_calls: state.metrics.applyCalls
+          });
+        }
+
+        return rows.length > 0;
+      } catch {
         if (sessionId !== state.sessionId) return;
-        if (!state.uploadFinalized) {
-          state.hasMore = true;
-          if (state.eventSource) {
-            state.eventSource.close();
-            state.eventSource = null;
-          }
-          setTimeout(() => startBackgroundLoading(sessionId), 150);
+        state.hasMore = !state.uploadFinalized || state.hasMore;
+        return false;
+      } finally {
+        state.pollInFlight = false;
+      }
+    }
+
+    // Inicia polling corto para continuar lectura en segundo plano.
+    function startBackgroundLoading(sessionId) {
+      if (sessionId !== state.sessionId || !state.hasMore || !state.uploadId) {
+        return;
+      }
+
+      if (state.pollTimer) {
+        return;
+      }
+
+      const tick = async () => {
+        state.pollTimer = 0;
+
+        if (sessionId !== state.sessionId || !state.hasMore || !state.uploadId) {
           return;
         }
 
-        state.hasMore = false;
-        if (state.eventSource) {
-          state.eventSource.close();
-          state.eventSource = null;
-        }
-      });
-
-      eventSource.addEventListener('error', () => {
-        if (sessionId !== state.sessionId) return;
-        if (state.streamPaused) return;
-        if (state.eventSource) {
-          state.eventSource.close();
-          state.eventSource = null;
+        if (state.incomingRows.length >= INCOMING_HIGH_WATER) {
+          state.pollTimer = setTimeout(tick, state.pollDelayMs);
+          return;
         }
 
-        if (state.hasMore) {
-          setTimeout(() => startBackgroundLoading(sessionId), 200);
+        const hadRows = await fetchRowsOnce(sessionId);
+
+        if (sessionId !== state.sessionId || !state.hasMore || !state.uploadId) {
+          return;
         }
-      });
+
+        state.pollDelayMs = hadRows ? POLL_FAST_MS : (state.uploadFinalized ? POLL_FAST_MS : POLL_IDLE_MS);
+
+        state.pollTimer = setTimeout(tick, state.pollDelayMs);
+      };
+
+      state.pollTimer = setTimeout(tick, 0);
     }
 
     // Encola filas de entrada para aplicación por lotes.
@@ -694,19 +814,30 @@ if (
     // Aplica filas por lotes con control de backpressure.
     function applyIncomingRowsBatch() {
       if (state.incomingRows.length === 0) return;
+      const applyStart = performance.now();
 
       const batch = state.incomingRows.splice(0, MAX_APPEND_PER_FRAME);
       state.rows.push(...batch);
-      updateCounter();
+      if (!state.metrics.firstRowsAt && batch.length > 0) {
+        state.metrics.firstRowsAt = performance.now();
+      }
+      const now = performance.now();
+      if ((now - state.metrics.lastUiRefreshAt) >= PERF_REFRESH_MS) {
+        updateCounter();
+        state.metrics.lastUiRefreshAt = now;
+      }
       scheduleRender();
 
       if (state.incomingRows.length > 0) {
         scheduleApplyIncomingRows();
       }
 
-      if (state.streamPaused && state.incomingRows.length <= INCOMING_LOW_WATER && state.hasMore) {
+      if (!state.pollTimer && !state.pollInFlight && state.incomingRows.length <= INCOMING_LOW_WATER && state.hasMore) {
         startBackgroundLoading(state.sessionId);
       }
+
+      state.metrics.applyCalls += 1;
+      state.metrics.applyTimeMs += performance.now() - applyStart;
     }
 
     
