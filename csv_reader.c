@@ -79,29 +79,42 @@ typedef struct {
     int    error;
 } Writer;
 
+typedef struct {
+    FILE *file;
+} CSVStreamCtx;
+
 static void writer_init_buf(Writer *w) {
     w->buf = NULL; w->len = 0; w->cap = 0; w->fp = NULL; w->error = 0;
 }
 
-static void writer_putchar(Writer *w, char c) {
-    if (w->error) return;
+static void writer_write(Writer *w, const char *data, size_t length) {
+    if (w->error || length == 0) return;
+
     if (w->fp) {
-        if (fputc((unsigned char)c, w->fp) == EOF) w->error = 1;
+        if (fwrite(data, 1, length, w->fp) != length) w->error = 1;
         return;
     }
-    if (w->len + 2 > w->cap) {
-        size_t nc = w->cap < 256 ? 4096 : w->cap * 2;
-        char *nb  = (char *)realloc(w->buf, nc);
+
+    if (w->len + length + 1 > w->cap) {
+        size_t nc = w->cap < 256 ? 4096 : w->cap;
+        while (w->len + length + 1 > nc) nc *= 2;
+        char *nb = (char *)realloc(w->buf, nc);
         if (!nb) { w->error = 1; return; }
         w->buf = nb;
         w->cap = nc;
     }
-    w->buf[w->len++] = c;
-    w->buf[w->len]   = '\0';
+
+    memcpy(w->buf + w->len, data, length);
+    w->len += length;
+    w->buf[w->len] = '\0';
+}
+
+static void writer_putchar(Writer *w, char c) {
+    writer_write(w, &c, 1);
 }
 
 static void writer_puts(Writer *w, const char *s) {
-    while (*s) writer_putchar(w, *s++);
+    writer_write(w, s, strlen(s));
 }
 
 static void writer_printf_ld(Writer *w, long val) {
@@ -125,20 +138,36 @@ static void writer_free(Writer *w) {
 
 static void write_json_escaped(Writer *w, const char *text) {
     const unsigned char *cursor = (const unsigned char *)text;
+    const unsigned char *runStart = cursor;
     writer_putchar(w, '"');
+
     while (*cursor) {
         unsigned char c = *cursor;
-        if      (c == '"')  writer_puts(w, "\\\"");
-        else if (c == '\\') writer_puts(w, "\\\\");
-        else if (c == '\b') writer_puts(w, "\\b");
-        else if (c == '\f') writer_puts(w, "\\f");
-        else if (c == '\n') writer_puts(w, "\\n");
-        else if (c == '\r') writer_puts(w, "\\r");
-        else if (c == '\t') writer_puts(w, "\\t");
-        else if (c < 32)    writer_printf_04x(w, c);
-        else                writer_putchar(w, (char)c);
+        if (c == '"' || c == '\\' || c == '\b' || c == '\f' || c == '\n' || c == '\r' || c == '\t' || c < 32) {
+            if (cursor > runStart) {
+                writer_write(w, (const char *)runStart, (size_t)(cursor - runStart));
+            }
+
+            if      (c == '"')  writer_puts(w, "\\\"");
+            else if (c == '\\') writer_puts(w, "\\\\");
+            else if (c == '\b') writer_puts(w, "\\b");
+            else if (c == '\f') writer_puts(w, "\\f");
+            else if (c == '\n') writer_puts(w, "\\n");
+            else if (c == '\r') writer_puts(w, "\\r");
+            else if (c == '\t') writer_puts(w, "\\t");
+            else writer_printf_04x(w, c);
+
+            cursor++;
+            runStart = cursor;
+            continue;
+        }
         cursor++;
     }
+
+    if (cursor > runStart) {
+        writer_write(w, (const char *)runStart, (size_t)(cursor - runStart));
+    }
+
     writer_putchar(w, '"');
 }
 
@@ -302,6 +331,8 @@ static int csv_process(FILE *file, long offset, long limit, int ndjsonMode, int 
                     write_ndjson_line(w, &row, row.count);
                     array_free_contents(&row);
                     array_init(&row);
+                    rowCount++;
+                    if (limit > 0 && rowCount >= limit) break;
                 } else if (!offsetMode && headers.count == 0) {
                     size_t i;
                     for (i = 0; i < row.count; i++) {
@@ -387,6 +418,15 @@ static int csv_process(FILE *file, long offset, long limit, int ndjsonMode, int 
         }
     }
 
+    if (ndjsonMode && !allowPartialFinalRow && hasPendingPartialRow) {
+        if (fseek(file, rowStartOffset, SEEK_SET) != 0) {
+            free(cellBuffer);
+            array_free_contents(&headers);
+            array_free_contents(&row);
+            return 14;
+        }
+    }
+
     if (!ndjsonMode) {
         nextOffset = ftell(file);
         hasMore    = (nextOffset >= 0 && !feof(file)) ? 1 : 0;
@@ -440,6 +480,75 @@ CSV_EXPORT char *csv_read_chunk(const char *path, long offset, long limit, int a
     }
 
     return w.buf; /* caller must free with csv_free() */
+}
+
+CSV_EXPORT CSVStreamCtx *csv_stream_open(const char *path, long offset) {
+    CSVStreamCtx *ctx = (CSVStreamCtx *)malloc(sizeof(CSVStreamCtx));
+    if (!ctx) return NULL;
+
+    ctx->file = fopen(path, "rb");
+    if (!ctx->file) {
+        free(ctx);
+        return NULL;
+    }
+
+    if (offset > 0 && fseek(ctx->file, offset, SEEK_SET) != 0) {
+        fclose(ctx->file);
+        free(ctx);
+        return NULL;
+    }
+
+    return ctx;
+}
+
+CSV_EXPORT char *csv_stream_next_ndjson(CSVStreamCtx *ctx, long limit, int allow_partial_final_row) {
+    long nextOffset;
+    int hasMore;
+    int peek;
+
+    if (!ctx || !ctx->file) return NULL;
+
+    Writer w;
+    writer_init_buf(&w);
+
+    if (csv_process(ctx->file, 0, limit, 1, allow_partial_final_row != 0, &w) != 0 || w.error) {
+        writer_free(&w);
+        return NULL;
+    }
+
+    nextOffset = ftell(ctx->file);
+    if (nextOffset < 0) {
+        writer_free(&w);
+        return NULL;
+    }
+
+    peek = fgetc(ctx->file);
+    if (peek == EOF) {
+        hasMore = 0;
+        clearerr(ctx->file);
+    } else {
+        hasMore = 1;
+        ungetc(peek, ctx->file);
+    }
+
+    writer_puts(&w, "__META__ {\"next_offset\":");
+    writer_printf_ld(&w, nextOffset);
+    writer_puts(&w, ",\"has_more\":");
+    writer_puts(&w, hasMore ? "true" : "false");
+    writer_puts(&w, "}\n");
+
+    if (w.error) {
+        writer_free(&w);
+        return NULL;
+    }
+
+    return w.buf;
+}
+
+CSV_EXPORT void csv_stream_close(CSVStreamCtx *ctx) {
+    if (!ctx) return;
+    if (ctx->file) fclose(ctx->file);
+    free(ctx);
 }
 
 CSV_EXPORT void csv_free(char *ptr) {

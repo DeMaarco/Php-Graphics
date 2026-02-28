@@ -19,7 +19,6 @@ if (
     ob_start('ob_gzhandler');
 }
 
-session_start();
 require_once __DIR__ . DIRECTORY_SEPARATOR . 'csv_chunk.php';
 
 // Solo GET para stream continuo con EventSource.
@@ -35,10 +34,54 @@ $uploadId = isset($_GET['upload_id']) ? (string)$_GET['upload_id'] : '';
 $offset = isset($_GET['offset']) ? (int)$_GET['offset'] : 0;
 $limit = isset($_GET['limit']) ? (int)$_GET['limit'] : 200;
 
-if ($uploadId === '') {
-    echo "event: error\n";
-    echo 'data: ' . json_encode(['error' => 'Falta upload_id.'], JSON_UNESCAPED_UNICODE) . "\n\n";
+function emitSseEvent(string $event, string $data): void
+{
+    echo "event: {$event}\n";
+    $lines = preg_split('/\r\n|\n|\r/', $data);
+    if (!is_array($lines) || $lines === []) {
+        echo "data: \n\n";
+        flush();
+        return;
+    }
+
+    foreach ($lines as $line) {
+        echo 'data: ' . $line . "\n";
+    }
+    echo "\n";
     flush();
+}
+
+function parseNdjsonChunkPayload(string $payload): array
+{
+    $metaMarker = "\n__META__ ";
+    $metaPos = strrpos($payload, $metaMarker);
+
+    if ($metaPos === false) {
+        if (strpos($payload, '__META__ ') === 0) {
+            $metaPos = 0;
+        } else {
+            throw new RuntimeException('Payload NDJSON sin metadatos.');
+        }
+    }
+
+    $rowsPart = $metaPos > 0 ? substr($payload, 0, $metaPos) : '';
+    $metaRaw = trim(substr($payload, $metaPos + ($metaPos > 0 ? strlen($metaMarker) : strlen('__META__ '))));
+    $meta = json_decode($metaRaw, true);
+
+    if (!is_array($meta)) {
+        throw new RuntimeException('Metadatos NDJSON inválidos.');
+    }
+
+    $nextOffset = (int)($meta['next_offset'] ?? 0);
+    $hasMore = (bool)($meta['has_more'] ?? false);
+    $trimmedRows = rtrim($rowsPart, "\r\n");
+    $rowCount = $trimmedRows === '' ? 0 : (substr_count($trimmedRows, "\n") + 1);
+
+    return [$rowsPart, $nextOffset, $hasMore, $rowCount];
+}
+
+if ($uploadId === '') {
+    emitSseEvent('error', json_encode(['error' => 'Falta upload_id.'], JSON_UNESCAPED_UNICODE));
     exit;
 }
 
@@ -52,19 +95,24 @@ if ($limit > 200000) {
     $limit = 200000;
 }
 
-$entry = $_SESSION['csv_uploads'][$uploadId] ?? null;
-$storedPath = is_array($entry) ? ($entry['path'] ?? null) : $entry;
+$entry = readUploadMeta($uploadId);
+$storedPath = is_array($entry) ? ($entry['path'] ?? null) : null;
 $chunkedUpload = is_array($entry) && isset($entry['upload_state']) && is_array($entry['upload_state']);
 $completeFlagPath = is_string($storedPath) ? ($storedPath . '.complete') : '';
 
 if (!is_string($storedPath) || !file_exists($storedPath)) {
-    echo "event: error\n";
-    echo 'data: ' . json_encode(['error' => 'Sesión de carga no encontrada o expirada.'], JSON_UNESCAPED_UNICODE) . "\n\n";
-    flush();
+    emitSseEvent('error', json_encode(['error' => 'Carga no encontrada o expirada.'], JSON_UNESCAPED_UNICODE));
     exit;
 }
 
-session_write_close();
+$ffi = getCSVReaderFFI();
+if ($ffi === null) {
+    emitSseEvent('error', json_encode([
+        'error' => 'FFI no disponible para streaming.',
+        'ffi_error' => getCSVReaderFFILastError(),
+    ], JSON_UNESCAPED_UNICODE));
+    exit;
+}
 
 // Se desactiva buffering para enviar eventos de forma inmediata.
 if (function_exists('apache_setenv')) {
@@ -77,31 +125,18 @@ while (ob_get_level() > 0) {
 }
 
 $hasMore = true;
-$currentOffset = $offset;
 $idleWaitMicros = 30000;
+$ctx = null;
+$currentLimit = $limit;
 
-function extractChunkMeta(string $json): array
-{
-    $nextOffset = 0;
-    $hasMore = false;
-
-    if (preg_match('/"next_offset":(\d+)/', $json, $match)) {
-        $nextOffset = (int)$match[1];
-    }
-    if (preg_match('/"has_more":(true|false)/', $json, $match)) {
-        $hasMore = $match[1] === 'true';
-    }
-
-    return [$nextOffset, $hasMore];
-}
-
-function chunkHasRows(string $json): bool
-{
-    return strpos($json, '"rows":[]') === false;
-}
+$adaptiveMinLimit = 20000;
+$adaptiveMaxLimit = 140000;
+$adaptiveTargetMs = 115.0;
 
 try {
-    // Bucle principal: lee chunks, emite evento rows y finaliza con event end.
+    $ctx = openCsvStreamFFI($ffi, $storedPath, $offset);
+
+    // Bucle principal: lee chunks NDJSON por contexto stateful.
     while ($hasMore) {
         if (connection_aborted()) {
             break;
@@ -116,9 +151,22 @@ try {
             $uploadComplete = ($completeFlagPath !== '' && file_exists($completeFlagPath));
         }
 
-        $chunkJson = readCsvChunkRaw($storedPath, $currentOffset, $limit, $uploadComplete);
-        [$nextOffset, $hasMore] = extractChunkMeta($chunkJson);
-        $currentOffset = $nextOffset;
+        $readStartedAt = microtime(true);
+        $payload = readCsvStreamNextNdjsonFFI($ffi, $ctx, $currentLimit, $uploadComplete);
+        $readElapsedMs = (microtime(true) - $readStartedAt) * 1000;
+        [$rowsNdjson, $nextOffset, $hasMore, $rowCount] = parseNdjsonChunkPayload($payload);
+
+        if ($rowCount > 0) {
+            if ($readElapsedMs > ($adaptiveTargetMs * 1.55) && $currentLimit > $adaptiveMinLimit) {
+                $currentLimit = max($adaptiveMinLimit, (int)floor($currentLimit * 0.86));
+            } elseif (
+                $readElapsedMs < ($adaptiveTargetMs * 0.72)
+                && $rowCount >= (int)floor($currentLimit * 0.9)
+                && $currentLimit < $adaptiveMaxLimit
+            ) {
+                $currentLimit = min($adaptiveMaxLimit, (int)floor($currentLimit * 1.12));
+            }
+        }
 
         if (!$hasMore) {
             // En carga por chunks se espera bandera .complete para confirmar EOF real.
@@ -128,24 +176,23 @@ try {
             }
             if (!$uploadComplete) {
                 $hasMore = true;
-                $chunkJson = preg_replace('/"has_more":false/', '"has_more":true', $chunkJson, 1);
             }
         }
 
-        if (chunkHasRows($chunkJson)) {
-            echo "event: rows\n";
-            echo 'data: ' . $chunkJson . "\n\n";
-            flush();
+        if ($rowCount > 0) {
+            emitSseEvent('rows_ndjson', $rowsNdjson);
+            emitSseEvent('meta', json_encode([
+                'next_offset' => $nextOffset,
+                'has_more' => $hasMore,
+            ], JSON_UNESCAPED_UNICODE));
         }
 
         if (!$hasMore) {
-            echo "event: end\n";
-            echo "data: {}\n\n";
-            flush();
+            emitSseEvent('end', '{}');
             break;
         }
 
-        if (!chunkHasRows($chunkJson)) {
+        if ($rowCount === 0) {
             // Evita busy-loop cuando aún no llegan más bytes del archivo chunked.
             usleep($idleWaitMicros);
             if ($idleWaitMicros < 80000) {
@@ -156,21 +203,18 @@ try {
         }
     }
 
-    // Limpieza final del archivo temporal y del estado de sesión.
+    // Limpieza final del archivo temporal y del metadata.
     if (!$hasMore && is_string($storedPath) && file_exists($storedPath)) {
         @unlink($storedPath);
         if ($chunkedUpload && $completeFlagPath !== '' && file_exists($completeFlagPath)) {
             @unlink($completeFlagPath);
         }
-
-        if (session_status() !== PHP_SESSION_ACTIVE) {
-            session_start();
-        }
-        unset($_SESSION['csv_uploads'][$uploadId]);
-        session_write_close();
+        deleteUploadMeta($uploadId);
     }
 } catch (Throwable $e) {
-    echo "event: error\n";
-    echo 'data: ' . json_encode(['error' => 'Error en streaming: ' . $e->getMessage()], JSON_UNESCAPED_UNICODE) . "\n\n";
-    flush();
+    emitSseEvent('error', json_encode(['error' => 'Error en streaming: ' . $e->getMessage()], JSON_UNESCAPED_UNICODE));
+} finally {
+    if ($ctx !== null) {
+        closeCsvStreamFFI($ffi, $ctx);
+    }
 }

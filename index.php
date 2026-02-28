@@ -93,6 +93,7 @@ if (
       width: 100%;
       height: 100dvh;
       overflow: auto;
+      overflow-anchor: none;
       padding: 70px 16px 16px;
       background: #0a0a0a;
     }
@@ -130,6 +131,15 @@ if (
     tbody td {
       min-height: 36px;
       line-height: 20px;
+    }
+
+    th.row-number,
+    td.row-number {
+      width: 90px;
+      min-width: 90px;
+      text-align: right;
+      color: #d0d0d0;
+      font-variant-numeric: tabular-nums;
     }
 
     tbody tr:nth-child(odd) {
@@ -282,12 +292,17 @@ if (
     const PREVIEW_BYTES = 16 * 1024 * 1024;
     const UPLOAD_CHUNK_BYTES = 8 * 1024 * 1024;
     const MAX_APPEND_PER_FRAME = 5000;
+    const MAX_BROWSER_SCROLL_PX = 33000000;
     const INCOMING_HIGH_WATER = CHUNK_SIZE * 2;
     const INCOMING_LOW_WATER = Math.max(500, Math.floor(CHUNK_SIZE / 2));
     const POLL_FAST_MS = 10;
     const POLL_IDLE_MS = 220;
     const PERF_REFRESH_MS = 400;
-    const PREFER_SSE = !['8080'].includes(window.location.port || '');
+    const POLL_LIMIT_MIN = 20000;
+    const POLL_LIMIT_MAX = 140000;
+    const POLL_TARGET_MS = 115;
+    const SSE_STALL_MS = 8000;
+    const PREFER_SSE = true;
 
     // Estado global de la sesión de carga/render.
     const state = {
@@ -307,8 +322,12 @@ if (
       pollTimer: 0,
       pollInFlight: false,
       eventSource: null,
+      sseLastActivityAt: 0,
+      sseWatchdogTimer: 0,
+      forcePolling: false,
       endSignals: 0,
       pollDelayMs: POLL_FAST_MS,
+      pollLimit: CHUNK_SIZE,
       renderRaf: 0,
       applyRaf: 0,
       incomingRows: [],
@@ -417,8 +436,15 @@ if (
         state.eventSource = null;
       }
       state.pollInFlight = false;
+      state.sseLastActivityAt = 0;
+      if (state.sseWatchdogTimer) {
+        clearTimeout(state.sseWatchdogTimer);
+        state.sseWatchdogTimer = 0;
+      }
+      state.forcePolling = false;
       state.endSignals = 0;
       state.pollDelayMs = POLL_FAST_MS;
+      state.pollLimit = CHUNK_SIZE;
       state.metrics = {
         startedAt: 0,
         uploadEndedAt: 0,
@@ -598,6 +624,24 @@ if (
       }
     }
 
+    function parseNdjsonRows(text) {
+      if (typeof text !== 'string' || text.trim() === '') {
+        return [];
+      }
+
+      const lines = text.split(/\r?\n/);
+      const rows = [];
+      for (let index = 0; index < lines.length; index += 1) {
+        const line = lines[index].trim();
+        if (!line) continue;
+        const parsed = safeParseJson(line);
+        if (Array.isArray(parsed)) {
+          rows.push(parsed);
+        }
+      }
+      return rows;
+    }
+
     // Genera vista previa local para mostrar encabezados de forma inmediata.
     async function buildLocalPreview(file) {
       const bytes = Math.min(file.size, PREVIEW_BYTES);
@@ -668,6 +712,11 @@ if (
     function buildTable(headers) {
       const thead = document.createElement('thead');
       const headerRow = document.createElement('tr');
+
+      const rowNumTh = document.createElement('th');
+      rowNumTh.textContent = '#';
+      rowNumTh.className = 'row-number';
+      headerRow.appendChild(rowNumTh);
 
       headers.forEach((value, index) => {
         const th = document.createElement('th');
@@ -755,12 +804,27 @@ if (
       const renderStart = performance.now();
 
       const total = state.rows.length;
-      const columnCount = Math.max(1, state.headers.length);
+      const dataColumnCount = Math.max(1, state.headers.length);
+      const totalColumnCount = dataColumnCount + 1;
       const viewportHeight = Math.max(260, tableWrap.clientHeight - 32);
       const visibleRows = Math.ceil(viewportHeight / ROW_HEIGHT);
       const scrollTop = tableWrap.scrollTop;
-      const start = Math.max(0, Math.floor(scrollTop / ROW_HEIGHT) - OVERSCAN);
+      const maxStart = Math.max(0, total - visibleRows);
+      const virtualTotalHeight = total * ROW_HEIGHT;
+      const effectiveTotalHeight = Math.min(virtualTotalHeight, MAX_BROWSER_SCROLL_PX);
+      const scrollScale = virtualTotalHeight > 0 ? (effectiveTotalHeight / virtualTotalHeight) : 1;
+      const maxScrollTop = Math.max(1, effectiveTotalHeight - viewportHeight);
+      const normalizedScroll = Math.max(0, Math.min(1, scrollTop / maxScrollTop));
+      const baseStart = Math.min(maxStart, Math.floor(normalizedScroll * maxStart));
+      const start = Math.max(0, baseStart - OVERSCAN);
       const end = Math.min(total, start + visibleRows + OVERSCAN * 2);
+      const renderedRows = Math.max(0, end - start);
+      const renderedHeightPx = renderedRows * ROW_HEIGHT;
+      const rawTopHeightPx = Math.max(0, Math.round(start * ROW_HEIGHT * scrollScale));
+      const maxTopByScrollPx = Math.max(0, Math.round(scrollTop + OVERSCAN * ROW_HEIGHT));
+      const maxTopByLayoutPx = Math.max(0, Math.round(effectiveTotalHeight - renderedHeightPx));
+      const topHeightPx = Math.max(0, Math.min(rawTopHeightPx, maxTopByScrollPx, maxTopByLayoutPx));
+      const bottomHeightPx = Math.max(0, Math.round(effectiveTotalHeight - topHeightPx - renderedHeightPx));
 
       const windowKey = `${start}:${end}`;
       const windowUnchanged = windowKey === state.lastRenderKey;
@@ -772,7 +836,7 @@ if (
         state.lastRenderTotal = total;
         const lastChild = state.tbody.lastElementChild;
         if (lastChild && lastChild.dataset.spacer === 'bottom') {
-          lastChild.firstElementChild.style.height = `${(total - end) * ROW_HEIGHT}px`;
+          lastChild.firstElementChild.style.height = `${bottomHeightPx}px`;
           return;
         }
       }
@@ -785,8 +849,8 @@ if (
       if (start > 0) {
         const spacerTop = document.createElement('tr');
         const spacerCell = document.createElement('td');
-        spacerCell.colSpan = columnCount;
-        spacerCell.style.height = `${start * ROW_HEIGHT}px`;
+        spacerCell.colSpan = totalColumnCount;
+        spacerCell.style.height = `${topHeightPx}px`;
         spacerCell.style.padding = '0';
         spacerCell.style.border = '0';
         spacerTop.appendChild(spacerCell);
@@ -797,7 +861,12 @@ if (
         const values = state.rows[index] || [];
         const tr = document.createElement('tr');
 
-        for (let col = 0; col < columnCount; col += 1) {
+        const rowNumberTd = document.createElement('td');
+        rowNumberTd.className = 'row-number';
+        rowNumberTd.textContent = String(index + 1);
+        tr.appendChild(rowNumberTd);
+
+        for (let col = 0; col < dataColumnCount; col += 1) {
           const td = document.createElement('td');
           td.textContent = values[col] ?? '';
           tr.appendChild(td);
@@ -810,8 +879,8 @@ if (
         const spacerBottom = document.createElement('tr');
         spacerBottom.dataset.spacer = 'bottom';
         const spacerCell = document.createElement('td');
-        spacerCell.colSpan = columnCount;
-        spacerCell.style.height = `${(total - end) * ROW_HEIGHT}px`;
+        spacerCell.colSpan = totalColumnCount;
+        spacerCell.style.height = `${bottomHeightPx}px`;
         spacerCell.style.padding = '0';
         spacerCell.style.border = '0';
         spacerBottom.appendChild(spacerCell);
@@ -840,7 +909,7 @@ if (
         const params = new URLSearchParams({
           upload_id: state.uploadId,
           offset: String(state.nextOffset),
-          limit: String(CHUNK_SIZE),
+          limit: String(state.pollLimit),
           compact: '1'
         });
 
@@ -877,7 +946,20 @@ if (
 
         state.metrics.pollCalls += 1;
         state.metrics.pollRows += rows.length;
-        state.metrics.pollTimeMs += performance.now() - pollStart;
+        const pollElapsedMs = performance.now() - pollStart;
+        state.metrics.pollTimeMs += pollElapsedMs;
+
+        if (rows.length > 0) {
+          if (pollElapsedMs > (POLL_TARGET_MS * 1.55) && state.pollLimit > POLL_LIMIT_MIN) {
+            state.pollLimit = Math.max(POLL_LIMIT_MIN, Math.floor(state.pollLimit * 0.86));
+          } else if (
+            pollElapsedMs < (POLL_TARGET_MS * 0.72)
+            && rows.length >= Math.floor(state.pollLimit * 0.9)
+            && state.pollLimit < POLL_LIMIT_MAX
+          ) {
+            state.pollLimit = Math.min(POLL_LIMIT_MAX, Math.floor(state.pollLimit * 1.12));
+          }
+        }
 
         if (!state.hasMore && state.uploadFinalized && !state.metrics.completeLogged) {
           state.metrics.completeLogged = true;
@@ -909,7 +991,7 @@ if (
 
     // Inicia polling corto para continuar lectura en segundo plano.
     function startBackgroundLoading(sessionId) {
-      if (PREFER_SSE) {
+      if (PREFER_SSE && !state.forcePolling) {
         startBackgroundLoadingSSE(sessionId);
         return;
       }
@@ -971,24 +1053,79 @@ if (
 
       const eventSource = new EventSource(`stream_rows.php?${params.toString()}`);
       state.eventSource = eventSource;
+      state.sseLastActivityAt = performance.now();
 
-      eventSource.addEventListener('rows', (event) => {
+      const armSseWatchdog = () => {
+        if (state.sseWatchdogTimer) {
+          clearTimeout(state.sseWatchdogTimer);
+        }
+
+        state.sseWatchdogTimer = setTimeout(() => {
+          if (sessionId !== state.sessionId) return;
+          if (!state.eventSource) return;
+          if (!state.hasMore || !state.uploadFinalized) {
+            armSseWatchdog();
+            return;
+          }
+
+          const idleMs = performance.now() - state.sseLastActivityAt;
+          if (idleMs < SSE_STALL_MS) {
+            armSseWatchdog();
+            return;
+          }
+
+          state.eventSource.close();
+          state.eventSource = null;
+          state.forcePolling = true;
+          startBackgroundLoading(sessionId);
+        }, 1200);
+      };
+
+      armSseWatchdog();
+
+      eventSource.addEventListener('rows_ndjson', (event) => {
         if (sessionId !== state.sessionId) return;
+        state.sseLastActivityAt = performance.now();
         if (!state.metrics.sseStartedAt) {
           state.metrics.sseStartedAt = performance.now();
         }
-        const payload = safeParseJson(event.data);
-        if (!payload || typeof payload !== 'object') return;
-
-        const rows = Array.isArray(payload.rows) ? payload.rows : [];
-        state.nextOffset = Number(payload.next_offset ?? state.nextOffset);
-        state.hasMore = Boolean(payload.has_more);
+        const rows = parseNdjsonRows(event.data);
         enqueueRows(rows);
 
         state.metrics.pollCalls += 1;
         state.metrics.pollRows += rows.length;
 
         refreshLoadCompletion();
+      });
+
+      eventSource.addEventListener('meta', (event) => {
+        if (sessionId !== state.sessionId) return;
+        state.sseLastActivityAt = performance.now();
+        const payload = safeParseJson(event.data);
+        if (!payload || typeof payload !== 'object') return;
+        state.nextOffset = Number(payload.next_offset ?? state.nextOffset);
+        state.hasMore = Boolean(payload.has_more);
+        refreshLoadCompletion();
+      });
+
+      eventSource.addEventListener('error', (event) => {
+        if (sessionId !== state.sessionId) return;
+        const payload = safeParseJson(event.data || '');
+        if (payload && payload.error) {
+          console.warn('[sse] server error', payload.error);
+        }
+        if (state.eventSource) {
+          state.eventSource.close();
+          state.eventSource = null;
+        }
+        if (state.sseWatchdogTimer) {
+          clearTimeout(state.sseWatchdogTimer);
+          state.sseWatchdogTimer = 0;
+        }
+        if (state.hasMore) {
+          state.forcePolling = true;
+          startBackgroundLoading(sessionId);
+        }
       });
 
       eventSource.addEventListener('end', () => {
@@ -999,23 +1136,13 @@ if (
           state.eventSource.close();
           state.eventSource = null;
         }
+        if (state.sseWatchdogTimer) {
+          clearTimeout(state.sseWatchdogTimer);
+          state.sseWatchdogTimer = 0;
+        }
         refreshLoadCompletion();
       });
 
-      eventSource.addEventListener('error', () => {
-        if (sessionId !== state.sessionId) return;
-        if (state.eventSource) {
-          state.eventSource.close();
-          state.eventSource = null;
-        }
-
-        if (state.hasMore) {
-          setTimeout(() => {
-            if (sessionId !== state.sessionId) return;
-            startBackgroundLoading(sessionId);
-          }, 120);
-        }
-      });
     }
 
     // Encola filas de entrada para aplicación por lotes.

@@ -3,6 +3,7 @@
 // Mantiene estado en sesión para validar orden y completitud de chunks.
 header('Content-Type: application/json; charset=UTF-8');
 session_start();
+require_once __DIR__ . DIRECTORY_SEPARATOR . 'csv_chunk.php';
 
 // Solo se admite POST porque el cuerpo trae bytes del chunk actual.
 if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
@@ -52,6 +53,7 @@ foreach ($_SESSION['csv_uploads'] as $id => $entry) {
     if ($created > 0 && ($now - $created) > $ttlSeconds) {
         @unlink($path);
         @unlink($path . '.complete');
+        deleteUploadMeta((string)$id);
         unset($_SESSION['csv_uploads'][$id]);
     }
 }
@@ -84,6 +86,16 @@ if ($uploadId === '') {
             'complete' => false,
         ],
     ];
+
+    writeUploadMeta($uploadId, [
+        'path' => $path,
+        'created_at' => $now,
+        'upload_state' => [
+            'expected_index' => 0,
+            'total_chunks' => $total,
+            'complete' => false,
+        ],
+    ]);
 }
 
 $entry = $_SESSION['csv_uploads'][$uploadId] ?? null;
@@ -150,6 +162,17 @@ $_SESSION['csv_uploads'][$uploadId]['upload_state'] = [
     'complete' => false,
 ];
 $_SESSION['csv_uploads'][$uploadId]['created_at'] = $now;
+
+writeUploadMeta($uploadId, [
+    'path' => $path,
+    'created_at' => $now,
+    'upload_state' => [
+        'expected_index' => $expected + 1,
+        'total_chunks' => $storedTotal,
+        'complete' => false,
+    ],
+]);
+
 session_write_close();
 
 echo json_encode([

@@ -26,10 +26,14 @@ if ($uploadId === '') {
     exit;
 }
 
-$entry = $_SESSION['csv_uploads'][$uploadId] ?? null;
+$entry = readUploadMeta($uploadId);
+if (!is_array($entry)) {
+    $entry = $_SESSION['csv_uploads'][$uploadId] ?? null;
+}
+
 if (!is_array($entry)) {
     http_response_code(404);
-    echo json_encode(['error' => 'Sesión de carga no encontrada.'], JSON_UNESCAPED_UNICODE);
+    echo json_encode(['error' => 'Carga no encontrada o expirada.'], JSON_UNESCAPED_UNICODE);
     exit;
 }
 
@@ -72,6 +76,17 @@ $_SESSION['csv_uploads'][$uploadId]['upload_state'] = [
     'complete' => true,
 ];
 $_SESSION['csv_uploads'][$uploadId]['created_at'] = time();
+
+$createdAt = time();
+writeUploadMeta($uploadId, [
+    'path' => $path,
+    'created_at' => $createdAt,
+    'upload_state' => [
+        'expected_index' => $expected,
+        'total_chunks' => $total,
+        'complete' => true,
+    ],
+]);
 
 $flagBytes = @file_put_contents($path . '.complete', '1', LOCK_EX);
 if ($flagBytes === false) {

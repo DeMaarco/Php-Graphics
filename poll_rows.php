@@ -3,7 +3,6 @@
 header('Content-Type: application/json; charset=UTF-8');
 header('Cache-Control: no-cache');
 
-session_start();
 require_once __DIR__ . DIRECTORY_SEPARATOR . 'csv_chunk.php';
 
 if ($_SERVER['REQUEST_METHOD'] !== 'GET') {
@@ -33,18 +32,16 @@ if ($limit > 200000) {
     $limit = 200000;
 }
 
-$entry = $_SESSION['csv_uploads'][$uploadId] ?? null;
-$storedPath = is_array($entry) ? ($entry['path'] ?? null) : $entry;
+$entry = readUploadMeta($uploadId);
+$storedPath = is_array($entry) ? ($entry['path'] ?? null) : null;
 $chunkedUpload = is_array($entry) && isset($entry['upload_state']) && is_array($entry['upload_state']);
 $completeFlagPath = is_string($storedPath) ? ($storedPath . '.complete') : '';
 
 if (!is_string($storedPath) || !file_exists($storedPath)) {
     http_response_code(404);
-    echo json_encode(['error' => 'Sesión de carga no encontrada o expirada.'], JSON_UNESCAPED_UNICODE);
+    echo json_encode(['error' => 'Carga no encontrada o expirada.'], JSON_UNESCAPED_UNICODE);
     exit;
 }
-
-session_write_close();
 
 try {
     $uploadComplete = true;
