@@ -4,9 +4,6 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends gcc \
     && rm -rf /var/lib/apt/lists/*
 
-RUN docker-php-ext-install ffi \
-    && docker-php-ext-enable ffi
-
 WORKDIR /var/www/html
 COPY . /var/www/html
 
