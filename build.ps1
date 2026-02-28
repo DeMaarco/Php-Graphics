@@ -49,7 +49,7 @@ function Assert-DllCompatibility {
 
 Assert-DllCompatibility
 Write-Host "Compilando DLL (FFI)..."
-Invoke-GCC @($src, "-shared", "-O2", "-o", $dll)
+Invoke-GCC @($src, "-shared", "-O3", "-o", $dll)
 Write-Host "OK: $dll"
 
 Write-Host ""

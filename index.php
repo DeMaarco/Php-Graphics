@@ -93,7 +93,7 @@ if (
       width: 100%;
       height: 100dvh;
       overflow: auto;
-      padding: 16px;
+      padding: 70px 16px 16px;
       background: #0a0a0a;
     }
 
@@ -143,11 +143,47 @@ if (
     #toolbar {
       display: none;
       position: fixed;
+      left: 16px;
       right: 16px;
-      top: 16px;
+      top: 12px;
       z-index: 10;
       gap: 8px;
       align-items: center;
+      background: rgba(16, 16, 16, 0.92);
+      border: 1px solid #2a2a2a;
+      border-radius: 10px;
+      padding: 8px 10px;
+      backdrop-filter: blur(8px);
+    }
+
+    #toolbarMeta {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      min-width: 0;
+      flex: 1;
+    }
+
+    #phaseBadge {
+      font-size: 0.78rem;
+      color: #f5f5f5;
+      background: #2b2b2b;
+      border: 1px solid #3a3a3a;
+      border-radius: 999px;
+      padding: 4px 9px;
+      white-space: nowrap;
+    }
+
+    #phaseBadge.ok {
+      background: #14321f;
+      border-color: #24683b;
+      color: #b7f6ca;
+    }
+
+    #phaseBadge.busy {
+      background: #2f270f;
+      border-color: #5e4a1e;
+      color: #f8e2a8;
     }
 
     #resetBtn {
@@ -168,10 +204,32 @@ if (
     #counter {
       font-size: 0.9rem;
       color: #e5e5e5;
-      background: #121212;
+      background: #171717;
       border: 1px solid #2f2f2f;
       border-radius: 8px;
       padding: 7px 10px;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      font-variant-numeric: tabular-nums;
+      min-width: 0;
+    }
+
+    #progressWrap {
+      width: 180px;
+      height: 8px;
+      border-radius: 999px;
+      background: #1f1f1f;
+      border: 1px solid #303030;
+      overflow: hidden;
+      flex: 0 0 auto;
+    }
+
+    #progressFill {
+      height: 100%;
+      width: 0%;
+      background: linear-gradient(90deg, #5a5a5a, #b4b4b4);
+      transition: width 0.15s ease;
     }
   </style>
 </head>
@@ -186,7 +244,13 @@ if (
     </div>
 
     <div id="toolbar">
-      <span id="counter">0 filas</span>
+      <div id="toolbarMeta">
+        <span id="phaseBadge">En espera</span>
+        <span id="counter">0 filas</span>
+      </div>
+      <div id="progressWrap" aria-hidden="true">
+        <div id="progressFill"></div>
+      </div>
       <button id="resetBtn" type="button">Cargar otro CSV</button>
     </div>
 
@@ -207,9 +271,11 @@ if (
     const resetBtn = document.getElementById('resetBtn');
     const counter = document.getElementById('counter');
     const status = document.getElementById('status');
+    const phaseBadge = document.getElementById('phaseBadge');
+    const progressFill = document.getElementById('progressFill');
 
     // Parámetros de rendimiento para carga, stream y virtualización de tabla.
-    const CHUNK_SIZE = 50000;
+    const CHUNK_SIZE = 70000;
     const ROW_HEIGHT = 36;
     const OVERSCAN = 8;
     const PREVIEW_ROWS = 5000;
@@ -294,11 +360,30 @@ if (
     tableWrap.addEventListener('scroll', () => scheduleRender());
     window.addEventListener('resize', () => scheduleRender());
 
+    function setPhase(message, mode = 'idle') {
+      status.textContent = message;
+      if (phaseBadge) {
+        phaseBadge.textContent = message || 'En espera';
+        phaseBadge.classList.remove('ok', 'busy');
+        if (mode === 'ok') {
+          phaseBadge.classList.add('ok');
+        } else if (mode === 'busy') {
+          phaseBadge.classList.add('busy');
+        }
+      }
+    }
+
+    function setProgress(percent) {
+      const clamped = Math.max(0, Math.min(100, Number(percent) || 0));
+      progressFill.style.width = `${clamped}%`;
+    }
+
     resetBtn.addEventListener('click', () => {
       clearCurrentSession();
       csvTable.innerHTML = '';
       fileInput.value = '';
-      status.textContent = '';
+      setPhase('', 'idle');
+      setProgress(0);
       counter.textContent = '0 filas';
       tableWrap.scrollTop = 0;
       tableWrap.style.display = 'none';
@@ -371,14 +456,16 @@ if (
       state.metrics.startedAt = performance.now();
 
       try {
-        status.textContent = 'Preparando vista previa y subiendo...';
+        setPhase('Preparando vista previa...', 'busy');
+        setProgress(2);
         dropzone.style.pointerEvents = 'none';
 
         let previewReady = false;
 
         const uploadPromise = uploadFileInChunks(file, {
           onProgress: (percent) => {
-            status.textContent = `Subiendo archivo... ${percent}%`;
+            setPhase(`Subiendo archivo... ${percent}%`, 'busy');
+            setProgress(percent);
           },
           onUploadId: (uploadId) => {
             if (!uploadId) return;
@@ -387,7 +474,10 @@ if (
             }
             state.hasMore = true;
           },
-          onChunkUploaded: () => {}
+          onChunkUploaded: () => {
+            if (!previewReady || sessionId !== state.sessionId || !state.uploadId) return;
+            startBackgroundLoading(sessionId);
+          }
         });
 
         const localPreview = await buildLocalPreview(file);
@@ -409,8 +499,12 @@ if (
         }
 
         previewReady = true;
+        if (state.uploadId) {
+          setPhase('Procesando filas...', 'busy');
+          startBackgroundLoading(sessionId);
+        }
 
-        status.textContent = 'Finalizando subida...';
+        setPhase('Finalizando subida...', 'busy');
         const payload = await uploadPromise;
         if (sessionId !== state.sessionId) return;
 
@@ -423,18 +517,13 @@ if (
         if (!state.uploadId) {
           state.uploadId = payload.upload_id || '';
         }
-        state.pendingAuthoritativeReplace = true;
-        state.skipInitialRows = 0;
-        state.previewEndOffset = 0;
-        state.nextOffset = 0;
-        updateCounter();
-        scheduleRender();
         state.hasMore = true;
         state.loadComplete = false;
         startBackgroundLoading(sessionId);
-        status.textContent = '';
+        setProgress(100);
+        setPhase('Procesando filas...', 'busy');
       } catch (error) {
-        status.textContent = '';
+        setPhase('', 'idle');
         alert(error.message || 'Error procesando el CSV.');
       } finally {
         dropzone.style.pointerEvents = 'auto';
@@ -645,7 +734,8 @@ if (
 
       state.loadComplete = isComplete;
       if (isComplete) {
-        status.textContent = 'Carga completa';
+        setPhase('Carga completa', 'ok');
+        setProgress(100);
       }
       updateCounter();
     }

@@ -47,7 +47,16 @@ if (!is_string($storedPath) || !file_exists($storedPath)) {
 session_write_close();
 
 try {
-    $chunk = readCsvChunk($storedPath, $offset, $limit);
+    $uploadComplete = true;
+    if ($chunkedUpload) {
+        clearstatcache(true, $storedPath);
+        if ($completeFlagPath !== '') {
+            clearstatcache(true, $completeFlagPath);
+        }
+        $uploadComplete = ($completeFlagPath !== '' && file_exists($completeFlagPath));
+    }
+
+    $chunk = readCsvChunk($storedPath, $offset, $limit, $uploadComplete);
     $rows = $chunk['rows'];
     $nextOffset = (int)$chunk['next_offset'];
     $hasMore = (bool)$chunk['has_more'];
@@ -57,10 +66,6 @@ try {
         if ($chunkedUpload && $completeFlagPath !== '') {
             clearstatcache(true, $completeFlagPath);
         }
-
-        $uploadComplete = $chunkedUpload
-            ? ($completeFlagPath !== '' && file_exists($completeFlagPath))
-            : true;
 
         if (!$uploadComplete) {
             $hasMore = true;

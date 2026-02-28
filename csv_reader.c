@@ -178,6 +178,7 @@ static void write_row(Writer *w, const StringArray *row, size_t columnCount, int
     if (!*isFirstRow) writer_putchar(w, ',');
     *isFirstRow = 0;
     writer_putchar(w, '[');
+
     for (i = 0; i < columnCount; i++) {
         if (i > 0) writer_putchar(w, ',');
         write_json_escaped(w, i < row->count ? row->items[i] : "");
@@ -197,7 +198,7 @@ static void write_ndjson_line(Writer *w, const StringArray *row, size_t columnCo
 
 /* ── Core CSV processing ─────────────────────────────────────────────────── */
 
-static int csv_process(FILE *file, long offset, long limit, int ndjsonMode, Writer *w) {
+static int csv_process(FILE *file, long offset, long limit, int ndjsonMode, int allowPartialFinalRow, Writer *w) {
     int ch;
     int inQuotes       = 0;
     int headersPrinted = 0;
@@ -206,7 +207,9 @@ static int csv_process(FILE *file, long offset, long limit, int ndjsonMode, Writ
     int offsetMode     = 0;
     long rowCount      = 0;
     long nextOffset    = 0;
+    long rowStartOffset = 0;
     int  hasMore       = 0;
+    int  hasPendingPartialRow = 0;
 
     char   *cellBuffer   = NULL;
     size_t  cellLength   = 0;
@@ -229,12 +232,19 @@ static int csv_process(FILE *file, long offset, long limit, int ndjsonMode, Writ
         }
         writer_puts(w, "{\"rows\":[");
         headersPrinted = 1;
+        rowStartOffset = offset;
+    } else {
+        rowStartOffset = 0;
     }
 
     while ((ch = fgetc(file)) != EOF) {
         char current = (char)ch;
 
-        if (skipLf && current == '\n') { skipLf = 0; continue; }
+        if (skipLf && current == '\n') {
+            skipLf = 0;
+            rowStartOffset = ftell(file);
+            continue;
+        }
         skipLf = 0;
 
         if (current == '"') {
@@ -317,9 +327,11 @@ static int csv_process(FILE *file, long offset, long limit, int ndjsonMode, Writ
                     rowCount++;
                     if (limit > 0 && rowCount >= limit) break;
                 }
+                rowStartOffset = ftell(file);
             } else {
                 array_free_contents(&row);
                 array_init(&row);
+                rowStartOffset = ftell(file);
             }
             continue;
         }
@@ -334,39 +346,43 @@ static int csv_process(FILE *file, long offset, long limit, int ndjsonMode, Writ
 
     /* flush last row (file has no trailing newline) */
     if (cellLength > 0 || row.count > 0) {
-        if (!push_current_cell(&row, cellBuffer)) {
-            free(cellBuffer);
-            array_free_contents(&headers);
-            array_free_contents(&row);
-            return 12;
-        }
-        if (!row_is_empty(&row)) {
-            if (ndjsonMode) {
-                write_ndjson_line(w, &row, row.count);
+        hasPendingPartialRow = 1;
+
+        if (allowPartialFinalRow) {
+            if (!push_current_cell(&row, cellBuffer)) {
+                free(cellBuffer);
+                array_free_contents(&headers);
                 array_free_contents(&row);
-                array_init(&row);
-            } else if (!offsetMode && headers.count == 0) {
-                size_t i;
-                for (i = 0; i < row.count; i++) {
-                    if (!array_push_owned(&headers, row.items[i])) {
-                        free(cellBuffer);
-                        array_free_contents(&headers);
-                        array_free_contents(&row);
-                        return 13;
+                return 12;
+            }
+            if (!row_is_empty(&row)) {
+                if (ndjsonMode) {
+                    write_ndjson_line(w, &row, row.count);
+                    array_free_contents(&row);
+                    array_init(&row);
+                } else if (!offsetMode && headers.count == 0) {
+                    size_t i;
+                    for (i = 0; i < row.count; i++) {
+                        if (!array_push_owned(&headers, row.items[i])) {
+                            free(cellBuffer);
+                            array_free_contents(&headers);
+                            array_free_contents(&row);
+                            return 13;
+                        }
                     }
+                    free(row.items);
+                    row.items    = NULL;
+                    row.count    = 0;
+                    row.capacity = 0;
+                    array_init(&row);
+                    write_headers(w, &headers);
+                    headersPrinted = 1;
+                } else {
+                    size_t colCount = offsetMode ? row.count : headers.count;
+                    write_row(w, &row, colCount, &firstDataRow);
+                    array_free_contents(&row);
+                    array_init(&row);
                 }
-                free(row.items);
-                row.items    = NULL;
-                row.count    = 0;
-                row.capacity = 0;
-                array_init(&row);
-                write_headers(w, &headers);
-                headersPrinted = 1;
-            } else {
-                size_t colCount = offsetMode ? row.count : headers.count;
-                write_row(w, &row, colCount, &firstDataRow);
-                array_free_contents(&row);
-                array_init(&row);
             }
         }
     }
@@ -375,6 +391,11 @@ static int csv_process(FILE *file, long offset, long limit, int ndjsonMode, Writ
         nextOffset = ftell(file);
         hasMore    = (nextOffset >= 0 && !feof(file)) ? 1 : 0;
         if (nextOffset < 0) nextOffset = 0;
+
+        if (!allowPartialFinalRow && hasPendingPartialRow) {
+            nextOffset = rowStartOffset;
+            hasMore = 1;
+        }
 
         if (!headersPrinted) {
             writer_puts(w, "{\"headers\":[],\"rows\":[],\"next_offset\":0,\"has_more\":false}");
@@ -403,14 +424,14 @@ static int csv_process(FILE *file, long offset, long limit, int ndjsonMode, Writ
  *
  * Returns NULL on error. Caller must free the result with csv_free().
  */
-CSV_EXPORT char *csv_read_chunk(const char *path, long offset, long limit) {
+CSV_EXPORT char *csv_read_chunk(const char *path, long offset, long limit, int allow_partial_final_row) {
     FILE *file = fopen(path, "rb");
     if (!file) return NULL;
 
     Writer w;
     writer_init_buf(&w);
 
-    int rc = csv_process(file, offset, limit, 0, &w);
+    int rc = csv_process(file, offset, limit, 0, allow_partial_final_row != 0, &w);
     fclose(file);
 
     if (rc != 0 || w.error) {

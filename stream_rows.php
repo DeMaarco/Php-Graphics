@@ -78,6 +78,27 @@ while (ob_get_level() > 0) {
 
 $hasMore = true;
 $currentOffset = $offset;
+$idleWaitMicros = 30000;
+
+function extractChunkMeta(string $json): array
+{
+    $nextOffset = 0;
+    $hasMore = false;
+
+    if (preg_match('/"next_offset":(\d+)/', $json, $match)) {
+        $nextOffset = (int)$match[1];
+    }
+    if (preg_match('/"has_more":(true|false)/', $json, $match)) {
+        $hasMore = $match[1] === 'true';
+    }
+
+    return [$nextOffset, $hasMore];
+}
+
+function chunkHasRows(string $json): bool
+{
+    return strpos($json, '"rows":[]') === false;
+}
 
 try {
     // Bucle principal: lee chunks, emite evento rows y finaliza con event end.
@@ -86,10 +107,18 @@ try {
             break;
         }
 
-        $chunk = readCsvChunk($storedPath, $currentOffset, $limit);
-        $rows = $chunk['rows'];
-        $currentOffset = (int)$chunk['next_offset'];
-        $hasMore = (bool)$chunk['has_more'];
+        $uploadComplete = true;
+        if ($chunkedUpload) {
+            clearstatcache(true, $storedPath);
+            if ($completeFlagPath !== '') {
+                clearstatcache(true, $completeFlagPath);
+            }
+            $uploadComplete = ($completeFlagPath !== '' && file_exists($completeFlagPath));
+        }
+
+        $chunkJson = readCsvChunkRaw($storedPath, $currentOffset, $limit, $uploadComplete);
+        [$nextOffset, $hasMore] = extractChunkMeta($chunkJson);
+        $currentOffset = $nextOffset;
 
         if (!$hasMore) {
             // En carga por chunks se espera bandera .complete para confirmar EOF real.
@@ -97,22 +126,15 @@ try {
             if ($chunkedUpload && $completeFlagPath !== '') {
                 clearstatcache(true, $completeFlagPath);
             }
-            $uploadComplete = $chunkedUpload
-                ? ($completeFlagPath !== '' && file_exists($completeFlagPath))
-                : true;
             if (!$uploadComplete) {
                 $hasMore = true;
+                $chunkJson = preg_replace('/"has_more":false/', '"has_more":true', $chunkJson, 1);
             }
         }
 
-        if (!empty($rows)) {
+        if (chunkHasRows($chunkJson)) {
             echo "event: rows\n";
-            echo 'data: ' . json_encode([
-                'rows' => $rows,
-                'next_offset' => $currentOffset,
-                'has_more' => $hasMore,
-                'engine' => $chunk['engine'] ?? 'unknown'
-            ], JSON_UNESCAPED_UNICODE) . "\n\n";
+            echo 'data: ' . $chunkJson . "\n\n";
             flush();
         }
 
@@ -123,9 +145,14 @@ try {
             break;
         }
 
-        if (empty($rows)) {
+        if (!chunkHasRows($chunkJson)) {
             // Evita busy-loop cuando aún no llegan más bytes del archivo chunked.
-            usleep(120000);
+            usleep($idleWaitMicros);
+            if ($idleWaitMicros < 80000) {
+                $idleWaitMicros += 5000;
+            }
+        } else {
+            $idleWaitMicros = 20000;
         }
     }
 

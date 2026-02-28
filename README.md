@@ -1,32 +1,34 @@
 # ETL PHP + C (FFI) para CSV grandes
 
-Proyecto mínimo para cargar un CSV grande desde navegador, parsearlo con una DLL en C vía FFI y visualizarlo en streaming.
+Visor de CSV grande en tiempo real con backend PHP + parser nativo en C (FFI).
 
-## Qué hace
+## Estado actual
 
-- Sube CSV por chunks (`upload_chunk.php`) para evitar límites de tamaño típicos.
-- Finaliza la carga (`upload_complete.php`) cuando todos los chunks llegaron.
-- Lee el CSV desde C (`csv_reader.dll`) por bloques y lo envía por SSE (`stream_rows.php`).
-- Renderiza la tabla en frontend con virtualización (`index.php`) para mantener rendimiento.
+- Carga de archivos por chunks (subida incremental).
+- Parseo CSV en C (`csv_reader.dll`) con API FFI.
+- Lectura incremental por SSE (`stream_rows.php`) y fallback por polling (`poll_rows.php`).
+- Render virtualizado en frontend para tablas con millones de filas.
+- Métricas en UI (`up`, `io`, `ui`) y barra de progreso.
 
-## Estructura actual (limpia)
+## Estructura
 
-- `index.php`: UI + lógica de carga chunked + render virtualizado + consumo SSE.
-- `upload_chunk.php`: recibe y valida chunks en orden.
-- `upload_complete.php`: marca una subida como completa.
-- `stream_rows.php`: transmite filas por `EventSource`.
-- `csv_chunk.php`: puente PHP ↔ FFI (`csv_reader.dll`).
+- `index.php`: interfaz, subida chunked, preview local, virtual scroll, SSE/polling.
+- `upload_chunk.php`: recibe chunks en orden y mantiene estado de subida en sesión.
+- `upload_complete.php`: cierra la subida y crea la marca `.complete`.
+- `stream_rows.php`: stream SSE con lectura incremental desde C.
+- `poll_rows.php`: endpoint JSON de lote único (fallback/sin SSE largo).
+- `csv_chunk.php`: puente PHP ↔ FFI (lectura estructurada y raw JSON).
 - `csv_reader.c`: parser CSV nativo exportado para FFI.
-- `csv_reader.dll`: binario compilado usado por PHP.
-- `build.ps1`: script para recompilar la DLL en Windows.
+- `csv_reader.dll`: binario compilado para Windows.
+- `build.ps1`: compilación de la DLL y validación de arquitectura.
 
 ## Requisitos
 
 - Windows + PowerShell.
-- PHP con:
+- PHP con FFI habilitado:
   - `extension=ffi`
   - `ffi.enable=true`
-- GCC (MinGW) en PATH para compilar `csv_reader.dll`.
+- GCC (MinGW) en `PATH` para compilar `csv_reader.dll`.
 
 ## Compilar la DLL
 
@@ -34,26 +36,49 @@ Proyecto mínimo para cargar un CSV grande desde navegador, parsearlo con una DL
 ./build.ps1
 ```
 
-## Ejecutar servidor local
+## Ejecutar en local
+
+### Opción rápida (PHP embebido)
 
 ```powershell
 php -d upload_max_filesize=2048M -d post_max_size=2048M -d memory_limit=4096M -d max_execution_time=0 -S 127.0.0.1:8080
 ```
 
-Luego abre:
+Abrir `http://127.0.0.1:8080`.
 
-- http://127.0.0.1:8080
+### Opción recomendada (Apache / XAMPP)
 
-## Flujo técnico resumido
+Para mejor comportamiento de SSE y concurrencia de requests, usar Apache (por ejemplo XAMPP) apuntando el DocumentRoot a esta carpeta.
 
-1. Frontend divide el archivo en chunks y los envía secuencialmente.
-2. Backend acumula bytes en archivo temporal de sesión.
-3. Al finalizar, se crea bandera `.complete`.
-4. SSE lee chunks de filas desde C (`csv_read_chunk`) y envía eventos `rows`.
-5. Frontend encola filas y renderiza solo las visibles.
+## Flujo técnico
 
-## Notas importantes
+1. `index.php` divide el archivo en chunks y los envía a `upload_chunk.php`.
+2. Backend concatena bytes en un temporal `.csv` por `upload_id`.
+3. `upload_complete.php` valida completitud y escribe la marca `.complete`.
+4. Frontend arranca lectura incremental:
+   - SSE en `stream_rows.php` (preferido), o
+   - polling corto en `poll_rows.php` (fallback).
+5. `csv_chunk.php` llama a `csv_reader.dll` (`csv_read_chunk`) y devuelve filas.
+6. Frontend encola lotes y renderiza solo filas visibles (virtualización).
 
-- El proyecto está en modo **FFI obligatorio** (sin fallback a parser PHP).
-- Cada subida vive en sesión con TTL; al terminar se limpia archivo temporal.
-- Si falla FFI, verifica `csv_reader.dll` y configuración de `php.ini`.
+## Notas de rendimiento
+
+- Ajustes principales en `index.php`:
+  - `CHUNK_SIZE`
+  - `UPLOAD_CHUNK_BYTES`
+  - `MAX_APPEND_PER_FRAME`
+- `stream_rows.php` usa passthrough de JSON crudo del parser C para reducir overhead en PHP.
+- El parser soporta lectura segura durante subida activa (sin perder última fila parcial).
+
+## Solución de problemas
+
+- **Error FFI no disponible**:
+  - Confirmar `extension=ffi` y `ffi.enable=true` en `php.ini`.
+  - Verificar que `csv_reader.dll` exista en la raíz del proyecto.
+- **No carga la DLL**:
+  - Revisar arquitectura: PHP y DLL deben ser ambos x64 o ambos x86.
+  - Recompilar con `./build.ps1`.
+- **SSE inestable en `php -S`**:
+  - Probar Apache/XAMPP o usar fallback polling.
+- **Sesión expirada/no encontrada**:
+  - Reintentar la carga; los temporales tienen TTL y se limpian automáticamente.
