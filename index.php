@@ -214,20 +214,24 @@ if (
     const OVERSCAN = 8;
     const PREVIEW_ROWS = 5000;
     const PREVIEW_BYTES = 16 * 1024 * 1024;
-    const UPLOAD_CHUNK_BYTES = 4 * 1024 * 1024;
-    const MAX_APPEND_PER_FRAME = 50000;
+    const UPLOAD_CHUNK_BYTES = 8 * 1024 * 1024;
+    const MAX_APPEND_PER_FRAME = 5000;
     const INCOMING_HIGH_WATER = CHUNK_SIZE * 2;
     const INCOMING_LOW_WATER = Math.max(500, Math.floor(CHUNK_SIZE / 2));
-    const POLL_FAST_MS = 45;
+    const POLL_FAST_MS = 10;
     const POLL_IDLE_MS = 220;
     const PERF_REFRESH_MS = 400;
+    const PREFER_SSE = !['8080'].includes(window.location.port || '');
 
     // Estado global de la sesión de carga/render.
     const state = {
       uploadId: '',
       nextOffset: 0,
+      previewEndOffset: 0,
       skipInitialRows: 0,
       hasMore: false,
+      loadComplete: false,
+      pendingAuthoritativeReplace: false,
       uploadFinalized: false,
       headers: [],
       rows: [],
@@ -236,6 +240,8 @@ if (
       lastRenderTotal: 0,
       pollTimer: 0,
       pollInFlight: false,
+      eventSource: null,
+      endSignals: 0,
       pollDelayMs: POLL_FAST_MS,
       renderRaf: 0,
       applyRaf: 0,
@@ -305,8 +311,11 @@ if (
       state.sessionId += 1;
       state.uploadId = '';
       state.nextOffset = 0;
+      state.previewEndOffset = 0;
       state.skipInitialRows = 0;
       state.hasMore = false;
+      state.loadComplete = false;
+      state.pendingAuthoritativeReplace = false;
       state.uploadFinalized = false;
       state.headers = [];
       state.rows = [];
@@ -318,7 +327,12 @@ if (
         clearTimeout(state.pollTimer);
         state.pollTimer = 0;
       }
+      if (state.eventSource) {
+        state.eventSource.close();
+        state.eventSource = null;
+      }
       state.pollInFlight = false;
+      state.endSignals = 0;
       state.pollDelayMs = POLL_FAST_MS;
       state.metrics = {
         startedAt: 0,
@@ -370,16 +384,10 @@ if (
             if (!uploadId) return;
             if (!state.uploadId) {
               state.uploadId = uploadId;
-              state.nextOffset = 0;
             }
             state.hasMore = true;
           },
-          onChunkUploaded: async () => {
-            if (!previewReady || sessionId !== state.sessionId || !state.uploadId) return;
-            if (!state.pollInFlight) {
-              startBackgroundLoading(sessionId);
-            }
-          }
+          onChunkUploaded: () => {}
         });
 
         const localPreview = await buildLocalPreview(file);
@@ -388,7 +396,9 @@ if (
         if (localPreview.headers.length > 0) {
           state.headers = localPreview.headers;
           state.rows = localPreview.rows;
-          state.skipInitialRows = localPreview.rows.length;
+          state.skipInitialRows = 0;
+          state.previewEndOffset = Math.max(0, Number(localPreview.endByteOffset || 0));
+          state.nextOffset = state.previewEndOffset;
           buildTable(state.headers);
           dropzone.style.display = 'none';
           tableWrap.style.display = 'block';
@@ -399,9 +409,6 @@ if (
         }
 
         previewReady = true;
-        if (state.uploadId) {
-          await fetchRowsOnce(sessionId);
-        }
 
         status.textContent = 'Finalizando subida...';
         const payload = await uploadPromise;
@@ -416,7 +423,14 @@ if (
         if (!state.uploadId) {
           state.uploadId = payload.upload_id || '';
         }
+        state.pendingAuthoritativeReplace = true;
+        state.skipInitialRows = 0;
+        state.previewEndOffset = 0;
+        state.nextOffset = 0;
+        updateCounter();
+        scheduleRender();
         state.hasMore = true;
+        state.loadComplete = false;
         startBackgroundLoading(sessionId);
         status.textContent = '';
       } catch (error) {
@@ -581,8 +595,15 @@ if (
     }
 
     // Actualiza contador visible de filas cargadas.
+    function getLoadedRowsCount() {
+      const appliedAndQueued = state.rows.length + state.incomingRows.length;
+      const backendReceived = state.metrics.pollRows;
+      return Math.max(appliedAndQueued, backendReceived);
+    }
+
     function updateCounter() {
-      const base = `${state.rows.length.toLocaleString('es-ES')} filas`;
+      const loadedRows = getLoadedRowsCount();
+      const base = `${loadedRows.toLocaleString('es-ES')} filas`;
       if (!state.metrics.startedAt) {
         counter.textContent = base;
         return;
@@ -593,7 +614,10 @@ if (
       const uploadMs = state.metrics.uploadEndedAt > 0
         ? (state.metrics.uploadEndedAt - state.metrics.startedAt)
         : elapsedMs;
-      const backendMs = state.metrics.pollTimeMs;
+      const sseMs = state.metrics.sseStartedAt > 0
+        ? ((state.metrics.sseEndedAt > 0 ? state.metrics.sseEndedAt : now) - state.metrics.sseStartedAt)
+        : 0;
+      const backendMs = Math.max(state.metrics.pollTimeMs, sseMs);
       const uiMs = state.metrics.renderTimeMs + state.metrics.applyTimeMs;
 
       const parts = [
@@ -603,7 +627,27 @@ if (
         `ui ${(uiMs / 1000).toFixed(1)}s`
       ];
 
+      if (state.loadComplete) {
+        parts.push('completo');
+      }
+
       counter.textContent = parts.join(' · ');
+    }
+
+    // Marca estado completo cuando no quedan lecturas ni filas pendientes.
+    function refreshLoadCompletion() {
+      const isComplete = state.uploadFinalized
+        && !state.hasMore
+        && !state.pollInFlight
+        && state.incomingRows.length === 0;
+
+      if (isComplete === state.loadComplete) return;
+
+      state.loadComplete = isComplete;
+      if (isComplete) {
+        status.textContent = 'Carga completa';
+      }
+      updateCounter();
     }
 
     // Programa un render en animation frame para evitar repaints excesivos.
@@ -706,27 +750,40 @@ if (
         const params = new URLSearchParams({
           upload_id: state.uploadId,
           offset: String(state.nextOffset),
-          limit: String(CHUNK_SIZE)
+          limit: String(CHUNK_SIZE),
+          compact: '1'
         });
 
         const response = await fetch(`poll_rows.php?${params.toString()}`);
-        const text = await response.text();
-        const payload = safeParseJson(text);
+        const payload = await response.json();
 
         if (!response.ok || !payload || payload.error) {
           throw new Error((payload && payload.error) || 'Error leyendo filas incrementales.');
         }
 
-        let rows = Array.isArray(payload.rows) ? payload.rows : [];
-        if (state.skipInitialRows > 0 && rows.length > 0) {
-          const cut = Math.min(state.skipInitialRows, rows.length);
-          rows = rows.slice(cut);
-          state.skipInitialRows -= cut;
-        }
+        const rows = Array.isArray(payload.r)
+          ? payload.r
+          : (Array.isArray(payload.rows) ? payload.rows : []);
 
-        state.nextOffset = Number(payload.next_offset ?? state.nextOffset);
-        state.hasMore = Boolean(payload.has_more);
+        state.nextOffset = Number((payload.n ?? payload.next_offset) ?? state.nextOffset);
+        const serverHasMore = Boolean((payload.h ?? payload.has_more));
+        if (serverHasMore) {
+          state.endSignals = 0;
+          state.hasMore = true;
+        } else {
+          state.endSignals += 1;
+          state.hasMore = state.endSignals < 2;
+        }
         enqueueRows(rows);
+
+        if (rows.length > 0) {
+          state.endSignals = 0;
+          if (!serverHasMore) {
+            state.endSignals = 1;
+            state.hasMore = true;
+          }
+        }
+        refreshLoadCompletion();
 
         state.metrics.pollCalls += 1;
         state.metrics.pollRows += rows.length;
@@ -756,11 +813,17 @@ if (
         return false;
       } finally {
         state.pollInFlight = false;
+        refreshLoadCompletion();
       }
     }
 
     // Inicia polling corto para continuar lectura en segundo plano.
     function startBackgroundLoading(sessionId) {
+      if (PREFER_SSE) {
+        startBackgroundLoadingSSE(sessionId);
+        return;
+      }
+
       if (sessionId !== state.sessionId || !state.hasMore || !state.uploadId) {
         return;
       }
@@ -795,10 +858,82 @@ if (
       state.pollTimer = setTimeout(tick, 0);
     }
 
+    // Inicia streaming SSE (mejor en servidores concurrentes como Apache).
+    function startBackgroundLoadingSSE(sessionId) {
+      if (sessionId !== state.sessionId || !state.hasMore || !state.uploadId) {
+        return;
+      }
+
+      if (state.eventSource) {
+        return;
+      }
+
+      if (state.pollTimer) {
+        clearTimeout(state.pollTimer);
+        state.pollTimer = 0;
+      }
+
+      const params = new URLSearchParams({
+        upload_id: state.uploadId,
+        offset: String(state.nextOffset),
+        limit: String(CHUNK_SIZE)
+      });
+
+      const eventSource = new EventSource(`stream_rows.php?${params.toString()}`);
+      state.eventSource = eventSource;
+
+      eventSource.addEventListener('rows', (event) => {
+        if (sessionId !== state.sessionId) return;
+        if (!state.metrics.sseStartedAt) {
+          state.metrics.sseStartedAt = performance.now();
+        }
+        const payload = safeParseJson(event.data);
+        if (!payload || typeof payload !== 'object') return;
+
+        const rows = Array.isArray(payload.rows) ? payload.rows : [];
+        state.nextOffset = Number(payload.next_offset ?? state.nextOffset);
+        state.hasMore = Boolean(payload.has_more);
+        enqueueRows(rows);
+
+        state.metrics.pollCalls += 1;
+        state.metrics.pollRows += rows.length;
+
+        refreshLoadCompletion();
+      });
+
+      eventSource.addEventListener('end', () => {
+        if (sessionId !== state.sessionId) return;
+        state.metrics.sseEndedAt = performance.now();
+        state.hasMore = false;
+        if (state.eventSource) {
+          state.eventSource.close();
+          state.eventSource = null;
+        }
+        refreshLoadCompletion();
+      });
+
+      eventSource.addEventListener('error', () => {
+        if (sessionId !== state.sessionId) return;
+        if (state.eventSource) {
+          state.eventSource.close();
+          state.eventSource = null;
+        }
+
+        if (state.hasMore) {
+          setTimeout(() => {
+            if (sessionId !== state.sessionId) return;
+            startBackgroundLoading(sessionId);
+          }, 120);
+        }
+      });
+    }
+
     // Encola filas de entrada para aplicación por lotes.
     function enqueueRows(rows) {
       if (!Array.isArray(rows) || rows.length === 0) return;
-      state.incomingRows.push(...rows);
+      for (let index = 0; index < rows.length; index += 1) {
+        state.incomingRows.push(rows[index]);
+      }
       scheduleApplyIncomingRows();
     }
 
@@ -817,7 +952,15 @@ if (
       const applyStart = performance.now();
 
       const batch = state.incomingRows.splice(0, MAX_APPEND_PER_FRAME);
-      state.rows.push(...batch);
+      if (state.pendingAuthoritativeReplace && batch.length > 0) {
+        state.rows = [];
+        state.pendingAuthoritativeReplace = false;
+        state.lastRenderKey = '';
+        state.lastRenderTotal = 0;
+      }
+      for (let index = 0; index < batch.length; index += 1) {
+        state.rows.push(batch[index]);
+      }
       if (!state.metrics.firstRowsAt && batch.length > 0) {
         state.metrics.firstRowsAt = performance.now();
       }
@@ -830,6 +973,8 @@ if (
 
       if (state.incomingRows.length > 0) {
         scheduleApplyIncomingRows();
+      } else {
+        updateCounter();
       }
 
       if (!state.pollTimer && !state.pollInFlight && state.incomingRows.length <= INCOMING_LOW_WATER && state.hasMore) {
@@ -838,6 +983,7 @@ if (
 
       state.metrics.applyCalls += 1;
       state.metrics.applyTimeMs += performance.now() - applyStart;
+      refreshLoadCompletion();
     }
 
     

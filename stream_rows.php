@@ -3,10 +3,21 @@
 header('Content-Type: text/event-stream; charset=UTF-8');
 header('Cache-Control: no-cache');
 header('X-Accel-Buffering: no');
+header('Vary: Accept-Encoding');
 
 @ini_set('max_execution_time', '0');
 @set_time_limit(0);
 @ignore_user_abort(true);
+
+if (
+    extension_loaded('zlib')
+    && !headers_sent()
+    && isset($_SERVER['HTTP_ACCEPT_ENCODING'])
+    && strpos((string)$_SERVER['HTTP_ACCEPT_ENCODING'], 'gzip') !== false
+    && !in_array('ob_gzhandler', ob_list_handlers(), true)
+) {
+    ob_start('ob_gzhandler');
+}
 
 session_start();
 require_once __DIR__ . DIRECTORY_SEPARATOR . 'csv_chunk.php';
@@ -37,8 +48,8 @@ if ($offset < 0) {
 if ($limit < 50) {
     $limit = 50;
 }
-if ($limit > 50000) {
-    $limit = 50000;
+if ($limit > 200000) {
+    $limit = 200000;
 }
 
 $entry = $_SESSION['csv_uploads'][$uploadId] ?? null;

@@ -15,6 +15,7 @@ if ($_SERVER['REQUEST_METHOD'] !== 'GET') {
 $uploadId = isset($_GET['upload_id']) ? (string)$_GET['upload_id'] : '';
 $offset = isset($_GET['offset']) ? (int)$_GET['offset'] : 0;
 $limit = isset($_GET['limit']) ? (int)$_GET['limit'] : 200;
+$compact = isset($_GET['compact']) && $_GET['compact'] === '1';
 
 if ($uploadId === '') {
     http_response_code(400);
@@ -28,8 +29,8 @@ if ($offset < 0) {
 if ($limit < 50) {
     $limit = 50;
 }
-if ($limit > 50000) {
-    $limit = 50000;
+if ($limit > 200000) {
+    $limit = 200000;
 }
 
 $entry = $_SESSION['csv_uploads'][$uploadId] ?? null;
@@ -66,25 +67,20 @@ try {
         }
     }
 
-    echo json_encode([
-        'rows' => $rows,
-        'next_offset' => $nextOffset,
-        'has_more' => $hasMore,
-        'engine' => $chunk['engine'] ?? 'unknown',
-    ], JSON_UNESCAPED_UNICODE);
-
-    if (!$hasMore && is_string($storedPath) && file_exists($storedPath)) {
-        @unlink($storedPath);
-        if ($chunkedUpload && $completeFlagPath !== '' && file_exists($completeFlagPath)) {
-            @unlink($completeFlagPath);
-        }
-
-        if (session_status() !== PHP_SESSION_ACTIVE) {
-            session_start();
-        }
-        unset($_SESSION['csv_uploads'][$uploadId]);
-        session_write_close();
+    if ($compact) {
+        echo json_encode([
+            'r' => $rows,
+            'n' => $nextOffset,
+            'h' => $hasMore,
+        ], JSON_UNESCAPED_UNICODE);
+    } else {
+        echo json_encode([
+            'rows' => $rows,
+            'next_offset' => $nextOffset,
+            'has_more' => $hasMore,
+        ], JSON_UNESCAPED_UNICODE);
     }
+
 } catch (Throwable $e) {
     http_response_code(500);
     echo json_encode(['error' => 'Error leyendo filas: ' . $e->getMessage()], JSON_UNESCAPED_UNICODE);
