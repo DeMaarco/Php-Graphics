@@ -3,7 +3,7 @@
 header('Content-Type: application/json; charset=UTF-8');
 header('Cache-Control: no-cache');
 
-require_once __DIR__ . DIRECTORY_SEPARATOR . 'csv_chunk.php';
+require_once __DIR__ . DIRECTORY_SEPARATOR . '..' . DIRECTORY_SEPARATOR . 'core' . DIRECTORY_SEPARATOR . 'csv_chunk.php';
 
 if ($_SERVER['REQUEST_METHOD'] !== 'GET') {
     http_response_code(405);
@@ -66,6 +66,12 @@ try {
 
         if (!$uploadComplete) {
             $hasMore = true;
+        } else {
+            @unlink($storedPath);
+            if ($chunkedUpload && $completeFlagPath !== '' && file_exists($completeFlagPath)) {
+                @unlink($completeFlagPath);
+            }
+            deleteUploadMeta($uploadId);
         }
     }
 

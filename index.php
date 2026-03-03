@@ -33,9 +33,10 @@ if (
     }
 
     #app {
-      min-height: 100dvh;
+      height: 100dvh;
       display: flex;
       flex-direction: column;
+      background: #0b0b0b;
     }
 
     #dropzone {
@@ -91,18 +92,20 @@ if (
     #tableWrap {
       display: none;
       width: 100%;
-      height: 100dvh;
+      flex: 1;
+      min-height: 0;
       overflow: auto;
       overflow-anchor: none;
-      padding: 70px 16px 16px;
+      padding: 0 12px 12px;
       background: #0a0a0a;
+      border-top: 1px solid #202020;
     }
 
     table {
       width: 100%;
       border-collapse: collapse;
       background: #121212;
-      border-radius: 10px;
+      border-radius: 8px;
       overflow: hidden;
     }
 
@@ -152,17 +155,19 @@ if (
 
     #toolbar {
       display: none;
-      position: fixed;
-      left: 16px;
-      right: 16px;
-      top: 12px;
-      z-index: 10;
+      position: sticky;
+      top: 0;
+      z-index: 2;
       gap: 8px;
       align-items: center;
-      background: rgba(16, 16, 16, 0.92);
-      border: 1px solid #2a2a2a;
-      border-radius: 10px;
-      padding: 8px 10px;
+      background: rgba(12, 12, 12, 0.95);
+      border-bottom: 1px solid #242424;
+      border-left: 0;
+      border-right: 0;
+      border-top: 0;
+      border-radius: 0;
+      margin: 0;
+      padding: 10px 12px;
       backdrop-filter: blur(8px);
     }
 
@@ -272,6 +277,8 @@ if (
   </div>
 
   <script>
+    // Frontend único del visor CSV.
+    // Todas las operaciones de backend viven en /api y el parser nativo en /native.
     // Referencias al DOM principal.
     const dropzone = document.getElementById('dropzone');
     const fileInput = document.getElementById('fileInput');
@@ -287,37 +294,39 @@ if (
     // Parámetros de rendimiento para carga, stream y virtualización de tabla.
     const CHUNK_SIZE = 70000;
     const ROW_HEIGHT = 36;
-    const OVERSCAN = 8;
+    const OVERSCAN = 6;
     const PREVIEW_ROWS = 5000;
     const PREVIEW_BYTES = 16 * 1024 * 1024;
     const UPLOAD_CHUNK_BYTES = 8 * 1024 * 1024;
-    const MAX_APPEND_PER_FRAME = 5000;
-    const MAX_BROWSER_SCROLL_PX = 33000000;
+    const MAX_APPEND_PER_FRAME = 3000;
     const INCOMING_HIGH_WATER = CHUNK_SIZE * 2;
     const INCOMING_LOW_WATER = Math.max(500, Math.floor(CHUNK_SIZE / 2));
-    const POLL_FAST_MS = 10;
+    const POLL_FAST_MS = 25;
     const POLL_IDLE_MS = 220;
     const PERF_REFRESH_MS = 400;
     const POLL_LIMIT_MIN = 20000;
     const POLL_LIMIT_MAX = 140000;
     const POLL_TARGET_MS = 115;
     const SSE_STALL_MS = 8000;
-    const PREFER_SSE = true;
+    const PREFER_SSE = false;
+    const SPACER_QUANTUM_PX = 1;
 
     // Estado global de la sesión de carga/render.
     const state = {
       uploadId: '',
       nextOffset: 0,
       previewEndOffset: 0,
-      skipInitialRows: 0,
       hasMore: false,
       loadComplete: false,
-      pendingAuthoritativeReplace: false,
       uploadFinalized: false,
       headers: [],
       rows: [],
       sessionId: 0,
       lastRenderKey: '',
+      lastRenderStart: -1,
+      lastRenderEnd: -1,
+      lastTopSpacerPx: -1,
+      lastBottomSpacerPx: -1,
       lastRenderTotal: 0,
       pollTimer: 0,
       pollInFlight: false,
@@ -332,10 +341,17 @@ if (
       applyRaf: 0,
       incomingRows: [],
       tbody: null,
+      layout: {
+        wrapPaddingTop: 0,
+        tableHeadHeight: ROW_HEIGHT,
+        bodyViewportHeight: 260,
+        rowHeight: ROW_HEIGHT
+      },
       metrics: {
         startedAt: 0,
         uploadEndedAt: 0,
         firstRowsAt: 0,
+        lastRenderKickAt: 0,
         pollCalls: 0,
         pollTimeMs: 0,
         pollRows: 0,
@@ -376,8 +392,11 @@ if (
       if (file) handleFile(file);
     });
 
-    tableWrap.addEventListener('scroll', () => scheduleRender());
-    window.addEventListener('resize', () => scheduleRender());
+    tableWrap.addEventListener('scroll', () => scheduleRender(), { passive: true });
+    window.addEventListener('resize', () => {
+      refreshLayoutMetrics();
+      scheduleRender();
+    });
 
     function setPhase(message, mode = 'idle') {
       status.textContent = message;
@@ -416,16 +435,24 @@ if (
       state.uploadId = '';
       state.nextOffset = 0;
       state.previewEndOffset = 0;
-      state.skipInitialRows = 0;
       state.hasMore = false;
       state.loadComplete = false;
-      state.pendingAuthoritativeReplace = false;
       state.uploadFinalized = false;
       state.headers = [];
       state.rows = [];
       state.lastRenderKey = '';
+      state.lastRenderStart = -1;
+      state.lastRenderEnd = -1;
+      state.lastTopSpacerPx = -1;
+      state.lastBottomSpacerPx = -1;
       state.lastRenderTotal = 0;
       state.tbody = null;
+      state.layout = {
+        wrapPaddingTop: 0,
+        tableHeadHeight: ROW_HEIGHT,
+        bodyViewportHeight: 260,
+        rowHeight: ROW_HEIGHT
+      };
       state.incomingRows = [];
       if (state.pollTimer) {
         clearTimeout(state.pollTimer);
@@ -449,6 +476,7 @@ if (
         startedAt: 0,
         uploadEndedAt: 0,
         firstRowsAt: 0,
+        lastRenderKickAt: 0,
         pollCalls: 0,
         pollTimeMs: 0,
         pollRows: 0,
@@ -469,6 +497,21 @@ if (
       }
     }
 
+    function refreshLayoutMetrics() {
+      const wrapStyles = getComputedStyle(tableWrap);
+      const wrapPaddingTop = Number.parseFloat(wrapStyles.paddingTop || '0') || 0;
+      const tableHeadHeight = csvTable.tHead
+        ? Math.round(csvTable.tHead.getBoundingClientRect().height)
+        : ROW_HEIGHT;
+      const bodyViewportHeight = Math.max(120, tableWrap.clientHeight);
+
+      state.layout.wrapPaddingTop = wrapPaddingTop;
+      state.layout.tableHeadHeight = tableHeadHeight;
+      state.layout.bodyViewportHeight = bodyViewportHeight;
+      state.layout.rowHeight = ROW_HEIGHT;
+          state.layout.rowHeight = ROW_HEIGHT;
+    }
+
     // Orquesta la subida chunked, construcción de tabla y stream incremental.
     async function handleFile(file) {
       const isCsv = file.type.includes('csv') || file.name.toLowerCase().endsWith('.csv');
@@ -486,8 +529,6 @@ if (
         setProgress(2);
         dropzone.style.pointerEvents = 'none';
 
-        let previewReady = false;
-
         const uploadPromise = uploadFileInChunks(file, {
           onProgress: (percent) => {
             setPhase(`Subiendo archivo... ${percent}%`, 'busy');
@@ -500,10 +541,7 @@ if (
             }
             state.hasMore = true;
           },
-          onChunkUploaded: () => {
-            if (!previewReady || sessionId !== state.sessionId || !state.uploadId) return;
-            startBackgroundLoading(sessionId);
-          }
+          onChunkUploaded: () => {}
         });
 
         const localPreview = await buildLocalPreview(file);
@@ -512,7 +550,6 @@ if (
         if (localPreview.headers.length > 0) {
           state.headers = localPreview.headers;
           state.rows = localPreview.rows;
-          state.skipInitialRows = 0;
           state.previewEndOffset = Math.max(0, Number(localPreview.endByteOffset || 0));
           state.nextOffset = state.previewEndOffset;
           buildTable(state.headers);
@@ -522,12 +559,6 @@ if (
           tableWrap.scrollTop = 0;
           updateCounter();
           scheduleRender();
-        }
-
-        previewReady = true;
-        if (state.uploadId) {
-          setPhase('Procesando filas...', 'busy');
-          startBackgroundLoading(sessionId);
         }
 
         setPhase('Finalizando subida...', 'busy');
@@ -578,7 +609,7 @@ if (
           params.set('upload_id', uploadId);
         }
 
-        const response = await fetch(`upload_chunk.php?${params.toString()}`, {
+        const response = await fetch(`api/upload_chunk.php?${params.toString()}`, {
           method: 'POST',
           headers: {
             'Content-Type': 'application/octet-stream'
@@ -598,7 +629,7 @@ if (
         onChunkUploaded(uploadId, index, totalChunks);
       }
 
-      const finalizeResponse = await fetch('upload_complete.php', {
+      const finalizeResponse = await fetch('api/upload_complete.php', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json'
@@ -730,6 +761,7 @@ if (
       csvTable.innerHTML = '';
       csvTable.appendChild(thead);
       csvTable.appendChild(state.tbody);
+      refreshLayoutMetrics();
     }
 
     // Actualiza contador visible de filas cargadas.
@@ -798,6 +830,26 @@ if (
       });
     }
 
+    function updateRenderedSpacers(topHeightPx, bottomHeightPx, start, end, total) {
+      if (!state.tbody) return;
+
+      if (start > 0) {
+        const topRow = state.tbody.firstElementChild;
+        const topCell = topRow?.firstElementChild;
+        if (topRow?.dataset?.spacer === 'top' && topCell) {
+          topCell.style.height = `${topHeightPx}px`;
+        }
+      }
+
+      if (end < total) {
+        const bottomRow = state.tbody.lastElementChild;
+        const bottomCell = bottomRow?.firstElementChild;
+        if (bottomRow?.dataset?.spacer === 'bottom' && bottomCell) {
+          bottomCell.style.height = `${bottomHeightPx}px`;
+        }
+      }
+    }
+
     // Renderiza solo filas visibles (virtual scroll).
     function renderVisibleRows() {
       if (!state.tbody) return;
@@ -806,48 +858,72 @@ if (
       const total = state.rows.length;
       const dataColumnCount = Math.max(1, state.headers.length);
       const totalColumnCount = dataColumnCount + 1;
-      const viewportHeight = Math.max(260, tableWrap.clientHeight - 32);
-      const visibleRows = Math.ceil(viewportHeight / ROW_HEIGHT);
+      const rowHeight = Math.max(1, Number(state.layout.rowHeight) || ROW_HEIGHT);
+      if (!state.layout.bodyViewportHeight || state.layout.bodyViewportHeight <= 0) {
+        refreshLayoutMetrics();
+      }
+      const visibleRows = Math.max(1, Math.ceil(state.layout.bodyViewportHeight / rowHeight));
       const scrollTop = tableWrap.scrollTop;
+      const bodyScrollTop = Math.max(0, scrollTop);
       const maxStart = Math.max(0, total - visibleRows);
-      const virtualTotalHeight = total * ROW_HEIGHT;
-      const effectiveTotalHeight = Math.min(virtualTotalHeight, MAX_BROWSER_SCROLL_PX);
-      const scrollScale = virtualTotalHeight > 0 ? (effectiveTotalHeight / virtualTotalHeight) : 1;
-      const maxScrollTop = Math.max(1, effectiveTotalHeight - viewportHeight);
-      const normalizedScroll = Math.max(0, Math.min(1, scrollTop / maxScrollTop));
-      const baseStart = Math.min(maxStart, Math.floor(normalizedScroll * maxStart));
+      const virtualTotalHeight = total * rowHeight;
+      const effectiveTotalHeight = virtualTotalHeight;
+      const maxScrollTop = Math.max(1, effectiveTotalHeight - state.layout.bodyViewportHeight);
+      const isNearBottom = (bodyScrollTop + state.layout.bodyViewportHeight) >= (maxScrollTop - 1);
+      const clampedBodyScrollTop = Math.max(0, Math.min(maxScrollTop, bodyScrollTop));
+      let baseStart = Math.min(
+        maxStart,
+        Math.max(0, Math.floor(clampedBodyScrollTop / rowHeight))
+      );
+      if (isNearBottom) {
+        baseStart = maxStart;
+      }
       const start = Math.max(0, baseStart - OVERSCAN);
       const end = Math.min(total, start + visibleRows + OVERSCAN * 2);
       const renderedRows = Math.max(0, end - start);
-      const renderedHeightPx = renderedRows * ROW_HEIGHT;
-      const rawTopHeightPx = Math.max(0, Math.round(start * ROW_HEIGHT * scrollScale));
-      const maxTopByScrollPx = Math.max(0, Math.round(scrollTop + OVERSCAN * ROW_HEIGHT));
-      const maxTopByLayoutPx = Math.max(0, Math.round(effectiveTotalHeight - renderedHeightPx));
-      const topHeightPx = Math.max(0, Math.min(rawTopHeightPx, maxTopByScrollPx, maxTopByLayoutPx));
-      const bottomHeightPx = Math.max(0, Math.round(effectiveTotalHeight - topHeightPx - renderedHeightPx));
-
-      const windowKey = `${start}:${end}`;
-      const windowUnchanged = windowKey === state.lastRenderKey;
-
-      if (windowUnchanged && total === state.lastRenderTotal) return;
-
-      // If only total changed (rows appended below viewport) just update bottom spacer
-      if (windowUnchanged && total > state.lastRenderTotal && end < total) {
-        state.lastRenderTotal = total;
-        const lastChild = state.tbody.lastElementChild;
-        if (lastChild && lastChild.dataset.spacer === 'bottom') {
-          lastChild.firstElementChild.style.height = `${bottomHeightPx}px`;
-          return;
-        }
+      const renderedHeightPx = renderedRows * rowHeight;
+      const idealTopHeightPx = Math.max(0, start * rowHeight);
+      const topHeightPx = Math.max(0, Math.round(idealTopHeightPx / SPACER_QUANTUM_PX) * SPACER_QUANTUM_PX);
+      let bottomHeightPx = Math.max(
+        0,
+        Math.round(
+          (Math.max(0, effectiveTotalHeight - topHeightPx - renderedHeightPx) / SPACER_QUANTUM_PX)
+        ) * SPACER_QUANTUM_PX
+      );
+      if (end === total) {
+        bottomHeightPx = 0;
       }
 
-      state.lastRenderKey = windowKey;
+      const windowUnchanged =
+        start === state.lastRenderStart
+        && end === state.lastRenderEnd
+        && total === state.lastRenderTotal;
+
+      if (windowUnchanged) {
+        const spacersUnchanged =
+          topHeightPx === state.lastTopSpacerPx
+          && bottomHeightPx === state.lastBottomSpacerPx;
+
+        if (spacersUnchanged) return;
+
+        updateRenderedSpacers(topHeightPx, bottomHeightPx, start, end, total);
+        state.lastTopSpacerPx = topHeightPx;
+        state.lastBottomSpacerPx = bottomHeightPx;
+        return;
+      }
+
+      state.lastRenderKey = `${start}:${end}:${total}`;
+      state.lastRenderStart = start;
+      state.lastRenderEnd = end;
+      state.lastTopSpacerPx = topHeightPx;
+      state.lastBottomSpacerPx = bottomHeightPx;
       state.lastRenderTotal = total;
 
       const fragment = document.createDocumentFragment();
 
       if (start > 0) {
         const spacerTop = document.createElement('tr');
+        spacerTop.dataset.spacer = 'top';
         const spacerCell = document.createElement('td');
         spacerCell.colSpan = totalColumnCount;
         spacerCell.style.height = `${topHeightPx}px`;
@@ -888,6 +964,7 @@ if (
       }
 
       state.tbody.replaceChildren(fragment);
+
       state.metrics.renderCalls += 1;
       state.metrics.renderTimeMs += performance.now() - renderStart;
     }
@@ -913,7 +990,7 @@ if (
           compact: '1'
         });
 
-        const response = await fetch(`poll_rows.php?${params.toString()}`);
+        const response = await fetch(`api/poll_rows.php?${params.toString()}`);
         const payload = await response.json();
 
         if (!response.ok || !payload || payload.error) {
@@ -1051,7 +1128,7 @@ if (
         limit: String(CHUNK_SIZE)
       });
 
-      const eventSource = new EventSource(`stream_rows.php?${params.toString()}`);
+      const eventSource = new EventSource(`api/stream_rows.php?${params.toString()}`);
       state.eventSource = eventSource;
       state.sseLastActivityAt = performance.now();
 
@@ -1169,12 +1246,6 @@ if (
       const applyStart = performance.now();
 
       const batch = state.incomingRows.splice(0, MAX_APPEND_PER_FRAME);
-      if (state.pendingAuthoritativeReplace && batch.length > 0) {
-        state.rows = [];
-        state.pendingAuthoritativeReplace = false;
-        state.lastRenderKey = '';
-        state.lastRenderTotal = 0;
-      }
       for (let index = 0; index < batch.length; index += 1) {
         state.rows.push(batch[index]);
       }
@@ -1186,7 +1257,15 @@ if (
         updateCounter();
         state.metrics.lastUiRefreshAt = now;
       }
-      scheduleRender();
+      const shouldKickRender =
+        (now - state.metrics.lastRenderKickAt) >= 90
+        || !state.hasMore
+        || batch.length >= Math.floor(MAX_APPEND_PER_FRAME * 0.9);
+
+      if (shouldKickRender) {
+        scheduleRender();
+        state.metrics.lastRenderKickAt = now;
+      }
 
       if (state.incomingRows.length > 0) {
         scheduleApplyIncomingRows();

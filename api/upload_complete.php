@@ -2,7 +2,7 @@
 // Endpoint que cierra una subida por chunks y la marca como lista para lectura.
 header('Content-Type: application/json; charset=UTF-8');
 session_start();
-require_once __DIR__ . DIRECTORY_SEPARATOR . 'csv_chunk.php';
+require_once __DIR__ . DIRECTORY_SEPARATOR . '..' . DIRECTORY_SEPARATOR . 'core' . DIRECTORY_SEPARATOR . 'csv_chunk.php';
 
 // Solo POST para mantener semántica de mutación del estado de subida.
 if ($_SERVER['REQUEST_METHOD'] !== 'POST') {

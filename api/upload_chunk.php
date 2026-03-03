@@ -3,7 +3,7 @@
 // Mantiene estado en sesión para validar orden y completitud de chunks.
 header('Content-Type: application/json; charset=UTF-8');
 session_start();
-require_once __DIR__ . DIRECTORY_SEPARATOR . 'csv_chunk.php';
+require_once __DIR__ . DIRECTORY_SEPARATOR . '..' . DIRECTORY_SEPARATOR . 'core' . DIRECTORY_SEPARATOR . 'csv_chunk.php';
 
 // Solo se admite POST porque el cuerpo trae bytes del chunk actual.
 if ($_SERVER['REQUEST_METHOD'] !== 'POST') {

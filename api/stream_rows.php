@@ -19,7 +19,7 @@ if (
     ob_start('ob_gzhandler');
 }
 
-require_once __DIR__ . DIRECTORY_SEPARATOR . 'csv_chunk.php';
+require_once __DIR__ . DIRECTORY_SEPARATOR . '..' . DIRECTORY_SEPARATOR . 'core' . DIRECTORY_SEPARATOR . 'csv_chunk.php';
 
 // Solo GET para stream continuo con EventSource.
 if ($_SERVER['REQUEST_METHOD'] !== 'GET') {

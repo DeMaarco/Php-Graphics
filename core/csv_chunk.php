@@ -5,12 +5,12 @@ declare(strict_types=1);
 // Último error capturado al inicializar FFI para diagnóstico en endpoints.
 $GLOBALS['CSV_READER_FFI_ERROR'] = null;
 
-/* ── FFI helpers ─────────────────────────────────────────────────────────── */
+/* ── Utilidades FFI ─────────────────────────────────────────────────────── */
 
 /**
- * Loads the csv_reader shared library via PHP FFI (once per process).
- * Returns the FFI instance, or null if FFI is unavailable or the library
- * is not compiled yet.
+ * Carga la librería compartida del parser CSV mediante PHP FFI.
+ * Se inicializa una sola vez por proceso.
+ * Devuelve la instancia FFI o null si FFI/librería no están disponibles.
  */
 function getCSVReaderFFI(): ?FFI
 {
@@ -30,7 +30,11 @@ function getCSVReaderFFI(): ?FFI
         return null;
     }
 
-    $lib = __DIR__ . DIRECTORY_SEPARATOR . (PHP_OS_FAMILY === 'Windows' ? 'csv_reader.dll' : 'csv_reader.so');
+    $lib = __DIR__
+        . DIRECTORY_SEPARATOR . '..'
+        . DIRECTORY_SEPARATOR . 'native'
+        . DIRECTORY_SEPARATOR
+        . (PHP_OS_FAMILY === 'Windows' ? 'csv_reader.dll' : 'csv_reader.so');
     if (!file_exists($lib)) {
         $GLOBALS['CSV_READER_FFI_ERROR'] = 'No se encontró la librería compartida: ' . $lib;
         return null;
@@ -56,13 +60,14 @@ function getCSVReaderFFI(): ?FFI
 
 function getCSVReaderFFILastError(): ?string
 {
+    // Expone el último error de inicialización para diagnóstico en endpoints.
     $value = $GLOBALS['CSV_READER_FFI_ERROR'] ?? null;
     return is_string($value) ? $value : null;
 }
 
 /**
- * Read a chunk from a CSV file using the FFI-loaded C library.
- * Returns the same shape as readCsvChunk().
+ * Lee un bloque del CSV usando la librería C cargada por FFI.
+ * Devuelve la misma estructura que readCsvChunk().
  */
 function readCsvChunkFFI(FFI $ffi, string $filePath, int $offset, int $limit, bool $allowPartialFinalRow = true): array
 {
@@ -116,26 +121,9 @@ function readCsvChunk(string $filePath, int $startOffset, int $limit, bool $allo
     return $chunk;
 }
 
-function readCsvChunkRaw(string $filePath, int $startOffset, int $limit, bool $allowPartialFinalRow = true): string
-{
-    if (substr($filePath, -4) !== '.csv') {
-        throw new RuntimeException('FFI-only mode requiere archivos .csv.');
-    }
-
-    $ffi = getCSVReaderFFI();
-    if ($ffi === null) {
-        $detail = getCSVReaderFFILastError();
-        if ($detail === null || $detail === '') {
-            $detail = 'habilita extension=ffi y csv_reader.dll.';
-        }
-        throw new RuntimeException('FFI no disponible: ' . $detail);
-    }
-
-    return readCsvChunkRawFFI($ffi, $filePath, $startOffset, $limit, $allowPartialFinalRow);
-}
-
 function getUploadMetaPath(string $uploadId): string
 {
+    // Metadata persistido en %TEMP% para reducir acoplamiento con sesión PHP.
     return sys_get_temp_dir() . DIRECTORY_SEPARATOR . 'csv_meta_' . $uploadId . '.json';
 }
 
@@ -192,6 +180,7 @@ function deleteUploadMeta(string $uploadId): void
 
 function openCsvStreamFFI(FFI $ffi, string $filePath, int $offset)
 {
+    // Crea contexto stateful para streaming incremental (SSE).
     $ctx = $ffi->csv_stream_open($filePath, $offset);
     if (FFI::isNull($ctx)) {
         throw new RuntimeException('csv_stream_open (FFI) devolvió NULL.');

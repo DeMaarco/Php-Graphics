@@ -10,7 +10,7 @@
 
 #define INITIAL_BUFFER 256
 
-/* ── StringArray ─────────────────────────────────────────────────────────── */
+/* ── StringArray (arreglo dinámico de cadenas) ─────────────────────────── */
 
 typedef struct {
     char **items;
@@ -53,7 +53,7 @@ static void array_free_contents(StringArray *array) {
     array->capacity = 0;
 }
 
-/* ── Cell buffer ─────────────────────────────────────────────────────────── */
+/* ── Buffer de celda CSV ────────────────────────────────────────────────── */
 
 static int append_char(char **buffer, size_t *length, size_t *capacity, char character) {
     if (*length + 1 >= *capacity) {
@@ -69,13 +69,13 @@ static int append_char(char **buffer, size_t *length, size_t *capacity, char cha
     return 1;
 }
 
-/* ── Writer (output abstraction) ─────────────────────────────────────────── */
+/* ── Writer (abstracción de salida) ─────────────────────────────────────── */
 
 typedef struct {
-    char  *buf;   /* heap buffer (buffer mode only) */
+    char  *buf;   /* buffer en heap (solo modo memoria) */
     size_t len;
     size_t cap;
-    FILE  *fp;    /* NULL → buffer mode, non-NULL → file mode */
+    FILE  *fp;    /* NULL → modo memoria, no-NULL → modo archivo */
     int    error;
 } Writer;
 
@@ -134,7 +134,7 @@ static void writer_free(Writer *w) {
     w->buf = NULL; w->len = 0; w->cap = 0;
 }
 
-/* ── Output helpers ──────────────────────────────────────────────────────── */
+/* ── Utilidades de salida ───────────────────────────────────────────────── */
 
 static void write_json_escaped(Writer *w, const char *text) {
     const unsigned char *cursor = (const unsigned char *)text;
@@ -225,7 +225,7 @@ static void write_ndjson_line(Writer *w, const StringArray *row, size_t columnCo
     writer_puts(w, "]\n");
 }
 
-/* ── Core CSV processing ─────────────────────────────────────────────────── */
+/* ── Núcleo de procesamiento CSV ────────────────────────────────────────── */
 
 static int csv_process(FILE *file, long offset, long limit, int ndjsonMode, int allowPartialFinalRow, Writer *w) {
     int ch;
@@ -375,7 +375,7 @@ static int csv_process(FILE *file, long offset, long limit, int ndjsonMode, int 
         }
     }
 
-    /* flush last row (file has no trailing newline) */
+    /* Procesa la última fila cuando el archivo no termina en salto de línea */
     if (cellLength > 0 || row.count > 0) {
         hasPendingPartialRow = 1;
 
@@ -454,15 +454,15 @@ static int csv_process(FILE *file, long offset, long limit, int ndjsonMode, int 
     return 0;
 }
 
-/* ── Exported FFI API ────────────────────────────────────────────────────── */
+/* ── API exportada para FFI ─────────────────────────────────────────────── */
 
 /*
- * Returns a malloc'd, null-terminated JSON string:
+ * Devuelve una cadena JSON en memoria (malloc) terminada en null:
  *   {"headers":[...],"rows":[...],"next_offset":N,"has_more":true|false}
- * or for offset > 0:
+ * o, cuando offset > 0:
  *   {"rows":[...],"next_offset":N,"has_more":true|false}
  *
- * Returns NULL on error. Caller must free the result with csv_free().
+ * En error devuelve NULL. El llamador debe liberar con csv_free().
  */
 CSV_EXPORT char *csv_read_chunk(const char *path, long offset, long limit, int allow_partial_final_row) {
     FILE *file = fopen(path, "rb");
@@ -479,7 +479,7 @@ CSV_EXPORT char *csv_read_chunk(const char *path, long offset, long limit, int a
         return NULL;
     }
 
-    return w.buf; /* caller must free with csv_free() */
+    return w.buf; /* el llamador debe liberar con csv_free() */
 }
 
 CSV_EXPORT CSVStreamCtx *csv_stream_open(const char *path, long offset) {
